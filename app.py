@@ -225,7 +225,7 @@ def cache_meta():
         "buildStartedAt": cache_build_started_at,
         "lastError": last_cache_error,
         "lookbackDays": LOOKBACK_DAYS,
-        "note": "v18 uses Statcast event-derived ISO instead of MLB season ISO when cache hit."
+        "note": "v19 boosts elite xwOBAcon/Brl-BIP/HH profiles and separates kHR from Likely."
     }
     if not path.exists():
         return {**base, "exists": False, "fresh": False}
@@ -522,38 +522,63 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     swstr = safe_float(profile.get("swStr"), 10)
     p_hr9 = safe_float(opp_hr9, 1.0)
 
-    raw = 28
-    raw += scale(iso, .070, .260) * 8
-    raw += scale(hr_rate, .005, .060) * 4
-    raw += scale(brl, 3, 16) * 9
-    raw += scale(pulled, 1, 9) * 5
-    raw += scale(hh, 30, 56) * 7
+    # v19: tuned from your reference rows.
+    # kHR is power-quality: xwOBAcon, Brl/BIP and HH% matter more than ISO.
+    brl_exp = (max(brl, 0) ** 1.22) * 0.78
+    xcon_boost = max(0, (safe_float(xwobacon, 0.330) - 0.320)) * 78
+    xwoba_boost = max(0, (safe_float(xwoba, 0.300) - 0.300)) * 38
+
+    elite_combo = 0
+    if brl >= 14 and safe_float(xwobacon, 0) >= .420:
+        elite_combo += 6
+    if hh >= 55 and safe_float(xwobacon, 0) >= .430:
+        elite_combo += 4
+    if brl >= 17:
+        elite_combo += 3
+
+    raw = 24
+    raw += brl_exp
+    raw += scale(pulled, 1, 11) * 7
+    raw += xcon_boost
+    raw += xwoba_boost
+    raw += scale(hh, 28, 60) * 9
     raw += scale(sweet, 25, 46) * 4
-    raw += scale(fb, 15, 38) * 3
-    raw += scale(max_ev, 96, 114) * 3
-    raw += min(4, max(0, p_hr9 - .8) * 3.5)
-    if xwoba:
-        raw += min(3, max(0, (xwoba - .300) * 20))
-    if xwobacon:
-        raw += min(4, max(0, (xwobacon - .340) * 18))
-    raw -= scale(swstr, 10, 18) * 8
+    raw += scale(fb, 15, 40) * 3
+    raw += scale(max_ev, 96, 116) * 4
+    raw += scale(iso, .070, .280) * 4
+    raw += scale(hr_rate, .005, .060) * 3
+    raw += min(5, max(0, p_hr9 - .8) * 3.5)
+    raw += elite_combo
+
+    # Swing-and-miss suppresses Jordan Walker type profiles.
+    raw -= scale(swstr, 10, 19) * 8
 
     bip = safe_float(profile.get("BIP"), 0)
-    confidence = clamp(bip / 650, 0.55 if cache_hit else 0.65, 1)
-    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 75), 3)
+    confidence = clamp(bip / 450, 0.72 if cache_hit else 0.65, 1)
+    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 82), 3)
 
     pitcher_boost = min(4, max(0, p_hr9 - .8) * 3)
-    matchup = round(clamp(khr + pitcher_boost - 3.2, 0, 80), 3)
-    test_score = round(clamp(khr - 3.1 + scale(brl, 3, 16) * 2.5, 0, 80), 3)
+    matchup = round(clamp(khr + pitcher_boost + scale(xwobacon, .340, .480) * 7 - 7, 0, 90), 3)
+    test_score = round(clamp(khr + scale(brl, 3, 18) * 5 + scale(xwobacon, .340, .480) * 4 - 8, 0, 90), 3)
+
+    # Ceiling is upside: xwOBAcon, HH%, barrel rate and max EV drive it harder.
     ceiling = round(clamp(
-        22 + scale(max_ev, 96, 114) * 25 + scale(brl, 3, 16) * 18 + scale(hh, 30, 56) * 9 + scale(iso, .070, .260) * 8,
-        10, 99
+        18
+        + scale(max_ev, 96, 116) * 18
+        + scale(brl, 3, 18) * 22
+        + scale(hh, 30, 60) * 16
+        + scale(xwobacon, .320, .500) * 22
+        + scale(iso, .070, .280) * 5,
+        8, 99
     ), 3)
+
     zone_fit = round(clamp(
-        0.035 + (brl * 0.0018) + (pulled * 0.0010) + (0.010 if 12 <= la <= 28 else 0),
+        0.030 + (brl * 0.0022) + (pulled * 0.0014) + scale(xwobacon, .340, .480) * 0.025 + (0.008 if 12 <= la <= 28 else 0),
         0.020, 0.160
     ), 3)
-    likely = round(clamp(khr, 1, 70), 0)
+
+    # Likely is probability-like; not equal to kHR.
+    likely = round(clamp((khr * 0.55) + scale(xwobacon, .340, .480) * 12 - scale(swstr, 10, 19) * 6, 1, 65), 0)
 
     fallback_xwoba = round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None
     fallback_xwobacon = round(max(0.280, min(0.500, 0.300 + (slg * 0.18) + (iso * 0.30))), 3) if ab else None
@@ -656,7 +681,7 @@ def collect_hitter_rows(game_pk: int):
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v18 Statcast sample ISO", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v19 elite-contact calibration", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -674,7 +699,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v18 Statcast event-derived ISO + long cache",
+        "source": "v19 elite-contact calibration + Statcast event ISO",
         "hitters": hitters,
     }
 
