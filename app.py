@@ -696,10 +696,127 @@ def collect_hitter_rows(game_pk: int):
     rows.sort(key=lambda r: (-safe_float(r.get("kHR")), r.get("team", ""), r.get("name", "")))
     return rows
 
+
+
+def pitcher_skill_profile(pitcher_id):
+    if not pitcher_id:
+        return None
+    stat = pitcher_season_stats(int(pitcher_id), current_season())
+    if not stat:
+        return None
+
+    ip = safe_float(stat.get("inningsPitched"), 0)
+    bf = safe_float(stat.get("battersFaced"), 0)
+    so = safe_float(stat.get("strikeOuts"), 0)
+    bb = safe_float(stat.get("baseOnBalls"), 0)
+    hr = safe_float(stat.get("homeRuns"), 0)
+    hits = safe_float(stat.get("hits"), 0)
+
+    k_pct = (so / bf) * 100 if bf else 0
+    bb_pct = (bb / bf) * 100 if bf else 0
+    hr9 = (hr / ip) * 9 if ip else 0
+    era = safe_float(stat.get("era"), 0)
+    whip = safe_float(stat.get("whip"), 0)
+
+    siera = 4.20 - (k_pct - 20) * 0.055 + (bb_pct - 8) * 0.075 + max(0, hr9 - 1.0) * 0.45
+    siera = clamp((siera * 0.70) + (era * 0.30 if era else siera), 2.10, 7.50)
+
+    xwoba = clamp(0.335 - (k_pct - 20) * 0.0035 + (bb_pct - 8) * 0.0025 + (hr9 - 1.0) * 0.025, 0.230, 0.430)
+    csw = clamp(27 + (k_pct - 20) * 0.45 - (bb_pct - 8) * 0.18, 20, 36)
+    swstr = clamp(10 + (k_pct - 20) * 0.28, 6, 18)
+    ball = clamp(34 + (bb_pct - 8) * 0.75, 27, 42)
+
+    brl = clamp(6.5 + (hr9 - 1.0) * 2.8 - (k_pct - 20) * 0.05, 2.0, 15.0)
+    pulled = clamp(brl * 0.55 + (hr9 - 1.0) * 1.2, 0.5, 10.0)
+    fb = clamp(26 + (hr9 - 1.0) * 5.5, 12, 45)
+    hh = clamp(39 + (hits / max(ip, 1) - 1.0) * 8 + (hr9 - 1.0) * 4, 25, 58)
+
+    pitch_score = clamp(
+        50 + (k_pct - 22) * 0.9 + (30 - xwoba * 100) * 0.9 + (csw - 28) * 1.2
+        - (siera - 4.0) * 3.2 - max(0, hr9 - 1.0) * 3.0,
+        5, 80
+    )
+    strikeout_score = clamp(45 + (k_pct - 20) * 1.25 + (swstr - 10) * 1.5, 5, 80)
+
+    weak_score = clamp(
+        50 + (xwoba - .315) * 95 + (brl - 7) * 2.2 + (hh - 40) * 0.8
+        + (fb - 28) * 0.45 + max(0, hr9 - 1.0) * 8 - (swstr - 10) * 1.3,
+        5, 90
+    )
+
+    return {
+        "pitcherId": pitcher_id,
+        "pitchScore": round(pitch_score, 1),
+        "strikeoutScore": round(strikeout_score, 1),
+        "weakScore": round(weak_score, 1),
+        "xwOBA": round(xwoba, 3),
+        "CSW": round(csw, 1),
+        "swStr": round(swstr, 1),
+        "ball": round(ball, 1),
+        "SIERA": round(siera, 1),
+        "pulledBrl": round(pulled, 1),
+        "brlBip": round(brl, 1),
+        "FB": round(fb, 1),
+        "HH": round(hh, 1),
+        "KPercent": round(k_pct, 1),
+        "BBPercent": round(bb_pct, 1),
+        "HR9": round(hr9, 2),
+        "ERA": era,
+        "WHIP": whip,
+    }
+
+@app.get("/api/pitchers")
+@app.get("/pitchers")
+def pitcher_report():
+    ensure_cache_background()
+    games_today = get_games_raw(day_str(0))
+    rows = []
+
+    for game in games_today:
+        away = game.get("away") or {}
+        home = game.get("home") or {}
+        away_p = game.get("awayProbablePitcher") or {}
+        home_p = game.get("homeProbablePitcher") or {}
+
+        items = [
+            ("away", away_p, away, home),
+            ("home", home_p, home, away),
+        ]
+        for side, pitcher, team_obj, opp_obj in items:
+            pid = pitcher.get("id") if isinstance(pitcher, dict) else None
+            prof = pitcher_skill_profile(pid)
+            if not prof:
+                continue
+            team_ab = team_obj.get("abbreviation") or team_obj.get("name") or "TEAM"
+            opp_ab = opp_obj.get("abbreviation") or opp_obj.get("name") or "TEAM"
+            rows.append({
+                **prof,
+                "gamePk": game.get("gamePk"),
+                "gameDate": game.get("gameDate"),
+                "team": team_ab,
+                "opponent": opp_ab,
+                "teamLogo": team_logo(team_ab),
+                "opponentLogo": team_logo(opp_ab),
+                "pitcher": pitcher.get("fullName") or pitcher.get("name") or "TBD",
+                "matchup": f"{team_ab} @ {opp_ab}" if side == "away" else f"{opp_ab} @ {team_ab}",
+            })
+
+    top = sorted(rows, key=lambda r: -safe_float(r.get("pitchScore")))
+    weak = sorted(rows, key=lambda r: -safe_float(r.get("weakScore")))
+
+    return {
+        "date": day_str(0),
+        "count": len(rows),
+        "source": "Pitcher season skills + estimated contact allowed profile",
+        "pitchers": rows,
+        "topSlatePitchers": top,
+        "weakPitchers": weak,
+    }
+
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v20 air-contact calibration", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v21 hitter + pitcher reports", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
