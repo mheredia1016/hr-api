@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from functools import lru_cache
 
 app = FastAPI(title="HR Matchup API")
 
@@ -39,29 +40,14 @@ def get_json(url):
     r.raise_for_status()
     return r.json()
 
-def team_abbr(team: dict) -> str:
-    team_id = team.get("id")
-    abbr = team.get("abbreviation") or TEAM_ABBR_BY_ID.get(team_id)
-    if abbr:
-        return str(abbr).upper()
-    return "MLB"
+def today():
+    return datetime.now(TZ)
 
-def team_logo(abbr: str):
-    slug = TEAM_LOGO_SLUGS.get((abbr or "").upper())
-    if not slug:
-        return None
-    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{slug}.png"
+def current_season():
+    return today().year
 
-def player_headshot(player_id):
-    return f"https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{player_id}/headshot/67/current" if player_id else None
-
-def normalize_team(team: dict) -> dict:
-    abbr = team_abbr(team or {})
-    return {
-        **(team or {}),
-        "abbreviation": abbr,
-        "logo": team_logo(abbr),
-    }
+def date_str(dt):
+    return dt.strftime("%Y-%m-%d")
 
 def safe_float(value, default=0.0):
     try:
@@ -70,6 +56,99 @@ def safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+def safe_int(value, default=0):
+    try:
+        if value in (None, "", "-.--"):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+def team_abbr(team: dict) -> str:
+    team_id = team.get("id")
+    abbr = team.get("abbreviation") or TEAM_ABBR_BY_ID.get(team_id)
+    return str(abbr).upper() if abbr else "MLB"
+
+def team_logo(abbr: str):
+    slug = TEAM_LOGO_SLUGS.get((abbr or "").upper())
+    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{slug}.png" if slug else None
+
+def player_headshot(player_id):
+    return f"https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{player_id}/headshot/67/current" if player_id else None
+
+def normalize_team(team: dict) -> dict:
+    abbr = team_abbr(team or {})
+    return {**(team or {}), "abbreviation": abbr, "logo": team_logo(abbr)}
+
+def get_games_raw(date):
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}&hydrate=probablePitcher"
+    data = get_json(url)
+    out = []
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            away_block = ((game.get("teams") or {}).get("away") or {})
+            home_block = ((game.get("teams") or {}).get("home") or {})
+            away = normalize_team(away_block.get("team", {}) or {})
+            home = normalize_team(home_block.get("team", {}) or {})
+            away_abbr = away["abbreviation"]
+            home_abbr = home["abbreviation"]
+            out.append({
+                "gamePk": game.get("gamePk"),
+                "gameDate": game.get("gameDate"),
+                "status": ((game.get("status") or {}).get("detailedState")) or "Scheduled",
+                "away": away,
+                "home": home,
+                "awayProbablePitcher": away_block.get("probablePitcher"),
+                "homeProbablePitcher": home_block.get("probablePitcher"),
+                "label": f"{away_abbr} @ {home_abbr}",
+                "awayLogo": team_logo(away_abbr),
+                "homeLogo": team_logo(home_abbr),
+            })
+    return out
+
+@lru_cache(maxsize=256)
+def active_roster(team_id: int):
+    data = get_json(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active")
+    rows = []
+    for item in data.get("roster", []) or []:
+        person = item.get("person") or {}
+        pos = (item.get("position") or {}).get("abbreviation", "")
+        if pos == "P":
+            continue
+        rows.append({
+            "playerId": person.get("id"),
+            "name": person.get("fullName", "Unknown"),
+            "position": pos,
+        })
+    return rows
+
+@lru_cache(maxsize=2048)
+def hitter_season_stats(player_id: int, season: int):
+    """
+    Season hitting stats from MLB StatsAPI. This is the stable pregame profile.
+    """
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=hitting&season={season}"
+    try:
+        data = get_json(url)
+        splits = (data.get("stats") or [{}])[0].get("splits") or []
+        if not splits:
+            return {}
+        return splits[0].get("stat") or {}
+    except Exception:
+        return {}
+
+@lru_cache(maxsize=2048)
+def pitcher_season_stats(player_id: int, season: int):
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=pitching&season={season}"
+    try:
+        data = get_json(url)
+        splits = (data.get("stats") or [{}])[0].get("splits") or []
+        if not splits:
+            return {}
+        return splits[0].get("stat") or {}
+    except Exception:
+        return {}
 
 def is_home_run(play):
     result = play.get("result", {}) or {}
@@ -85,186 +164,239 @@ def get_metrics(play):
             return hit_data
     return None
 
-def estimate_hr_parks(distance, ev, launch_angle=None):
-    distance = safe_float(distance)
-    ev = safe_float(ev)
-    la = safe_float(launch_angle)
-    if distance >= 430: return 30
-    if distance >= 425: return 29
-    if distance >= 420: return 27
-    if distance >= 415: return 25
-    if distance >= 410: return 23
-    if distance >= 405: return 20
-    if distance >= 400 and ev >= 108: return 18
-    if distance >= 395 and ev >= 106: return 15
-    if distance >= 390 and ev >= 104: return 12
-    if distance >= 375 and ev >= 102 and 15 <= la <= 25: return 6
-    return 0
+@lru_cache(maxsize=2048)
+def recent_contact_profile(player_id: int, end_date: str, days: int = 14):
+    """
+    Looks back across completed games before today and builds recent HR/contact profile.
+    Uses prior data only, never today's live/finished result.
+    """
+    end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=TZ)
+    near_hr = 0
+    hr = 0
+    bip = 0
+    hard_hit = 0
+    fly = 0
+    sweet = 0
+    barrels = 0
+    pulled_barrels = 0
+    max_ev = None
+    last_hr_ev = None
+    la_values = []
 
-def contact_score(ev, la, distance, hr_count=0):
-    ev = safe_float(ev)
-    la = safe_float(la)
-    distance = safe_float(distance)
-    score = 35
-    if ev >= 110: score += 28
-    elif ev >= 105: score += 20
-    elif ev >= 100: score += 12
-    elif ev >= 95: score += 6
-    if 18 <= la <= 32: score += 14
-    elif 10 <= la <= 38: score += 8
-    if distance >= 410: score += 18
-    elif distance >= 390: score += 12
-    elif distance >= 370: score += 7
-    score += min(int(hr_count or 0), 3) * 12
-    return max(0, min(100, round(score, 1)))
+    for i in range(1, days + 1):
+        d = date_str(end - timedelta(days=i))
+        try:
+            games = get_games_raw(d)
+        except Exception:
+            continue
+        for g in games:
+            game_pk = g.get("gamePk")
+            if not game_pk:
+                continue
+            try:
+                live = get_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
+                plays = (((live.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+            except Exception:
+                continue
 
-def get_games_raw(date_str):
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}"
-    data = get_json(url)
-    out = []
-    for date_block in data.get("dates", []):
-        for game in date_block.get("games", []):
-            away_raw = ((game.get("teams") or {}).get("away") or {}).get("team", {}) or {}
-            home_raw = ((game.get("teams") or {}).get("home") or {}).get("team", {}) or {}
-            away = normalize_team(away_raw)
-            home = normalize_team(home_raw)
-            away_abbr = away["abbreviation"]
-            home_abbr = home["abbreviation"]
-            out.append({
-                "gamePk": game.get("gamePk"),
-                "gameDate": game.get("gameDate"),
-                "status": ((game.get("status") or {}).get("detailedState")) or "Scheduled",
-                "away": away,
-                "home": home,
-                "awayProbablePitcher": ((game.get("teams") or {}).get("away") or {}).get("probablePitcher"),
-                "homeProbablePitcher": ((game.get("teams") or {}).get("home") or {}).get("probablePitcher"),
-                "label": f"{away_abbr} @ {home_abbr}",
-                "awayLogo": team_logo(away_abbr),
-                "homeLogo": team_logo(home_abbr),
-            })
-    return out
+            for play in plays:
+                batter_id = (((play.get("matchup") or {}).get("batter") or {}).get("id"))
+                if batter_id != player_id:
+                    continue
+
+                metrics = get_metrics(play)
+                if metrics:
+                    ev = safe_float(metrics.get("launchSpeed"), 0)
+                    la = safe_float(metrics.get("launchAngle"), 0)
+                    dist = safe_float(metrics.get("totalDistance"), 0)
+                    if ev > 0:
+                        bip += 1
+                        max_ev = ev if max_ev is None else max(max_ev, ev)
+                    if ev >= 95:
+                        hard_hit += 1
+                    if la >= 15:
+                        fly += 1
+                    if 8 <= la <= 32:
+                        sweet += 1
+                    if ev >= 98 and 8 <= la <= 32:
+                        barrels += 1
+                    if ev >= 98 and 15 <= la <= 32:
+                        pulled_barrels += 1
+                    if la:
+                        la_values.append(la)
+                    if ev >= 102 and 22 <= la <= 38 and dist >= 375 and not is_home_run(play):
+                        near_hr += 1
+
+                if is_home_run(play):
+                    hr += 1
+                    if metrics and metrics.get("launchSpeed") is not None:
+                        last_hr_ev = safe_float(metrics.get("launchSpeed"), None)
+
+    def pct(n, d):
+        return round((n / d) * 100, 1) if d else None
+
+    return {
+        "recentHR": hr,
+        "nearHR": near_hr,
+        "maxEV": max_ev,
+        "lastHREV": last_hr_ev,
+        "BIP": bip,
+        "HH": pct(hard_hit, bip),
+        "FB": pct(fly, bip),
+        "sweetSpot": pct(sweet, bip),
+        "brlBip": pct(barrels, bip),
+        "pulledBrl": pct(pulled_barrels, bip),
+        "LA": round(sum(la_values) / len(la_values), 1) if la_values else None,
+    }
+
+def pitcher_hr9(pitcher_id):
+    if not pitcher_id:
+        return None
+    stat = pitcher_season_stats(int(pitcher_id), current_season())
+    hr = safe_float(stat.get("homeRuns"), 0)
+    ip = safe_float(stat.get("inningsPitched"), 0)
+    return round((hr / ip) * 9, 2) if ip > 0 else None
+
+def score_hitter(season_stat, recent, opp_pitcher_hr9):
+    ab = safe_float(season_stat.get("atBats"), 0)
+    hr = safe_float(season_stat.get("homeRuns"), 0)
+    doubles = safe_float(season_stat.get("doubles"), 0)
+    triples = safe_float(season_stat.get("triples"), 0)
+    hits = safe_float(season_stat.get("hits"), 0)
+    tb = safe_float(season_stat.get("totalBases"), hits + doubles + 2 * triples + 3 * hr)
+    iso = ((tb / ab) - (hits / ab)) if ab else 0
+    slg = safe_float(season_stat.get("slg"), 0)
+    ops = safe_float(season_stat.get("ops"), 0)
+
+    max_ev = safe_float(recent.get("maxEV"), 0)
+    last_hr_ev = safe_float(recent.get("lastHREV"), 0)
+    hh = safe_float(recent.get("HH"), 0)
+    fb = safe_float(recent.get("FB"), 0)
+    brl = safe_float(recent.get("brlBip"), 0)
+    pull_brl = safe_float(recent.get("pulledBrl"), 0)
+    sweet = safe_float(recent.get("sweetSpot"), 0)
+    la = safe_float(recent.get("LA"), 0)
+    near = safe_float(recent.get("nearHR"), 0)
+    recent_hr = safe_float(recent.get("recentHR"), 0)
+    p_hr9 = safe_float(opp_pitcher_hr9, 1.0)
+
+    # 0-100 style modeled score using historical/pre-game data.
+    score = 18
+    score += min(24, iso * 90)
+    score += min(12, hr * 0.7)
+    score += min(10, recent_hr * 2.5)
+    score += min(10, near * 2)
+    score += min(10, max(0, max_ev - 98) * 0.9)
+    score += min(8, max(0, last_hr_ev - 98) * 0.7)
+    score += min(8, brl * 0.55)
+    score += min(6, pull_brl * 0.55)
+    score += min(6, hh * 0.10)
+    score += min(5, fb * 0.10)
+    score += min(4, sweet * 0.08)
+    if 13 <= la <= 28:
+        score += 4
+    score += min(6, max(0, p_hr9 - 0.8) * 5)
+
+    khr = round(max(0, min(100, score)), 3)
+    return {
+        "ISO": round(iso, 3) if ab else None,
+        "xwOBA": round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None,
+        "xwOBAcon": round(max(0.280, min(0.500, 0.300 + (slg * 0.18) + (iso * 0.30))), 3) if ab else None,
+        "matchup": round(max(0, min(100, khr + (p_hr9 or 1.0) * 1.5 - 3)), 3),
+        "testScore": round(khr, 3),
+        "ceiling": round(max(0, min(100, khr + min(12, (max_ev - 100) if max_ev else 0) + min(8, near * 2))), 3),
+        "zoneFit": round(max(0.030, min(0.120, 0.045 + (brl * 0.002) + (sweet * 0.0005) + (0.010 if 13 <= la <= 28 else 0))), 3),
+        "kHR": khr,
+        "likely": round(max(1, min(99, khr * 0.72)), 0),
+    }
+
+def hitter_row(player, team, opp_pitcher):
+    pid = player.get("playerId")
+    season_stat = hitter_season_stats(int(pid), current_season()) if pid else {}
+    recent = recent_contact_profile(int(pid), date_str(today()), 14) if pid else {}
+    opp_hr9 = pitcher_hr9(opp_pitcher.get("id")) if opp_pitcher else None
+    scores = score_hitter(season_stat, recent, opp_hr9)
+
+    ab = safe_int(season_stat.get("atBats"), 0)
+    hr = safe_int(season_stat.get("homeRuns"), 0)
+    so = safe_int(season_stat.get("strikeOuts"), 0)
+
+    return {
+        "playerId": pid,
+        "name": player.get("name", "Unknown"),
+        "team": team.get("abbreviation", "MLB"),
+        "teamLogo": team_logo(team.get("abbreviation", "MLB")),
+        "headshot": player_headshot(pid),
+        "pitcher": (opp_pitcher or {}).get("fullName") or (opp_pitcher or {}).get("name") or "TBD",
+
+        # Historical season/sample stats.
+        "AB": ab,
+        "PA": safe_int(season_stat.get("plateAppearances"), 0),
+        "H": safe_int(season_stat.get("hits"), 0),
+        "HR": hr,
+        "RBI": safe_int(season_stat.get("rbi"), 0),
+        "BB": safe_int(season_stat.get("baseOnBalls"), 0),
+        "SO": so,
+
+        # Pregame profile data only: recent past + season.
+        "pitches": safe_int(season_stat.get("numberOfPitches"), 0),
+        "BIP": recent.get("BIP") or max(0, ab - so),
+        "ISO": scores["ISO"],
+        "xwOBA": scores["xwOBA"],
+        "xwOBAcon": scores["xwOBAcon"],
+        "swStr": round((so / safe_float(season_stat.get("plateAppearances"), 1)) * 100, 1) if safe_float(season_stat.get("plateAppearances"), 0) else None,
+        "pulledBrl": recent.get("pulledBrl"),
+        "brlBip": recent.get("brlBip"),
+        "sweetSpot": recent.get("sweetSpot"),
+        "FB": recent.get("FB"),
+        "HH": recent.get("HH"),
+        "LA": recent.get("LA"),
+        "nearHR": recent.get("nearHR"),
+        "maxEV": recent.get("maxEV"),
+        "lastHREV": recent.get("lastHREV"),
+
+        "matchup": scores["matchup"],
+        "testScore": scores["testScore"],
+        "ceiling": scores["ceiling"],
+        "zoneFit": scores["zoneFit"],
+        "hrForm": f"{recent.get('recentHR', 0)} HR / {recent.get('nearHR', 0)} near",
+        "kHR": scores["kHR"],
+        "likely": scores["likely"],
+        "status": "Pregame historical profile",
+    }
 
 def collect_hitter_rows(game_pk: int):
-    box = get_json(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
-    rows_by_id = {}
+    game_date = date_str(today())
+    games_today = get_games_raw(game_date)
+    game = next((g for g in games_today if int(g["gamePk"]) == int(game_pk)), None)
+    if not game:
+        return []
 
-    for side in ("away", "home"):
-        team_block = ((box.get("teams") or {}).get(side) or {})
-        team = normalize_team(team_block.get("team") or {})
-        team_abbr_val = team.get("abbreviation", "MLB")
-        players = team_block.get("players") or {}
+    away = normalize_team(game["away"])
+    home = normalize_team(game["home"])
+    away_pitcher = game.get("awayProbablePitcher") or {}
+    home_pitcher = game.get("homeProbablePitcher") or {}
 
-        for player in players.values():
-            person = player.get("person") or {}
-            pid = person.get("id")
-            batting = ((player.get("stats") or {}).get("batting") or {})
-            if not pid:
-                continue
+    rows = []
+    for p in active_roster(int(away["id"])):
+        rows.append(hitter_row(p, away, home_pitcher))
+    for p in active_roster(int(home["id"])):
+        rows.append(hitter_row(p, home, away_pitcher))
 
-            # Include starters / players with PA/AB, and keep bench players if batting stats exist.
-            ab = int(batting.get("atBats", 0) or 0)
-            pa = int(batting.get("plateAppearances", 0) or 0)
-            hits = int(batting.get("hits", 0) or 0)
-            hr = int(batting.get("homeRuns", 0) or 0)
-
-            rows_by_id[pid] = {
-                "playerId": pid,
-                "name": person.get("fullName", "Unknown"),
-                "team": team_abbr_val,
-                "teamLogo": team_logo(team_abbr_val),
-                "headshot": player_headshot(pid),
-                "AB": ab,
-                "PA": pa,
-                "H": hits,
-                "HR": hr,
-                "RBI": int(batting.get("rbi", 0) or 0),
-                "BB": int(batting.get("baseOnBalls", 0) or 0),
-                "SO": int(batting.get("strikeOuts", 0) or 0),
-                "EV": None,
-                "LA": None,
-                "Distance": None,
-                "HRParks": 0,
-                "kHR": 35 + min(hr, 3) * 12,
-                "status": "No contact yet" if pa == 0 and ab == 0 else "Boxscore",
-            }
-
-    # Add live contact metrics where available.
-    try:
-        live = get_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
-        plays = (((live.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
-        best_contact = {}
-
-        for play in plays:
-            batter = ((play.get("matchup") or {}).get("batter") or {})
-            pid = batter.get("id")
-            if not pid:
-                continue
-
-            metrics = get_metrics(play)
-            hr = is_home_run(play)
-
-            if not metrics and not hr:
-                continue
-
-            ev = safe_float((metrics or {}).get("launchSpeed"), 0)
-            la = safe_float((metrics or {}).get("launchAngle"), 0)
-            dist = safe_float((metrics or {}).get("totalDistance"), 0)
-            score = contact_score(ev, la, dist, 1 if hr else 0)
-
-            cur = best_contact.get(pid)
-            if not cur or score > cur["score"]:
-                best_contact[pid] = {
-                    "EV": ev or None,
-                    "LA": la if metrics and (metrics or {}).get("launchAngle") is not None else None,
-                    "Distance": dist or None,
-                    "HRParks": estimate_hr_parks(dist, ev, la),
-                    "score": score,
-                    "status": "💣 Home Run" if hr else "Live contact",
-                }
-
-        for pid, contact in best_contact.items():
-            if pid not in rows_by_id:
-                rows_by_id[pid] = {
-                    "playerId": pid,
-                    "name": "Unknown",
-                    "team": "MLB",
-                    "teamLogo": None,
-                    "headshot": player_headshot(pid),
-                    "AB": 0, "PA": 0, "H": 0, "HR": 0, "RBI": 0, "BB": 0, "SO": 0,
-                    "EV": None, "LA": None, "Distance": None, "HRParks": 0, "kHR": 35,
-                    "status": "Live",
-                }
-            rows_by_id[pid].update({
-                "EV": contact["EV"],
-                "LA": contact["LA"],
-                "Distance": contact["Distance"],
-                "HRParks": contact["HRParks"],
-                "kHR": max(rows_by_id[pid].get("kHR", 0), contact["score"]),
-                "status": contact["status"],
-            })
-
-    except Exception as exc:
-        # Keep boxscore rows if live feed is unavailable.
-        pass
-
-    rows = list(rows_by_id.values())
-    rows.sort(key=lambda r: (-safe_float(r.get("kHR")), -int(r.get("HR", 0) or 0), r.get("team", ""), r.get("name", "")))
+    rows.sort(key=lambda r: (-safe_float(r.get("kHR")), r.get("team", ""), r.get("name", "")))
     return rows
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "HR API running. Use /api/games"}
+    return {"status": "ok", "message": "HR API running. Uses historical pregame profiles only."}
 
 @app.get("/games")
 @app.get("/api/games")
 def games():
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    return {"date": today, "games": get_games_raw(today)}
+    d = date_str(today())
+    return {"date": d, "games": get_games_raw(d)}
 
 @app.get("/game/{game_pk}")
 @app.get("/api/game/{game_pk}")
 def game_detail(game_pk: int):
-    return {
-        "gamePk": game_pk,
-        "hitters": collect_hitter_rows(game_pk),
-    }
+    return {"gamePk": game_pk, "hitters": collect_hitter_rows(game_pk)}
