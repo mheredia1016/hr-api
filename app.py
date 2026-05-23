@@ -200,7 +200,7 @@ def pitcher_hr9(pitcher_id):
     return round((hr / ip) * 9, 2) if ip > 0 else None
 
 def cache_file():
-    return CACHE_DIR / f"statcast_iso_v18_{day_str(0)}.json"
+    return CACHE_DIR / f"statcast_air_v20_{day_str(0)}.json"
 
 def cache_is_fresh():
     path = cache_file()
@@ -225,7 +225,7 @@ def cache_meta():
         "buildStartedAt": cache_build_started_at,
         "lastError": last_cache_error,
         "lookbackDays": LOOKBACK_DAYS,
-        "note": "v19 boosts elite xwOBAcon/Brl-BIP/HH profiles and separates kHR from Likely."
+        "note": "v20 recalculates HH/SweetSpot/PulledBrl using air-contact definitions and lowers Likely scaling."
     }
     if not path.exists():
         return {**base, "exists": False, "fresh": False}
@@ -279,7 +279,7 @@ def empty_raw():
     return {
         "pitches": 0, "bip": 0, "ev_sum": 0.0, "ev_count": 0, "max_ev": None,
         "la_sum": 0.0, "la_count": 0, "hard_hit": 0, "sweet": 0, "fb": 0,
-        "barrels": 0, "pulled_barrels": 0, "near_hr": 0, "recent_hr": 0,
+        "air_bip": 0, "hard_air": 0, "sweet_air": 0, "barrels": 0, "pulled_barrels": 0, "near_hr": 0, "recent_hr": 0,
         "last_hr_ev": None, "xwoba_sum": 0.0, "xwoba_count": 0,
         "xwobacon_sum": 0.0, "xwobacon_count": 0, "swinging_strikes": 0,
         "ab": 0, "h": 0, "tb": 0,
@@ -354,15 +354,26 @@ def add_row(p, row):
         p["max_ev"] = ev if p["max_ev"] is None else max(p["max_ev"], ev)
         p["la_sum"] += la
         p["la_count"] += 1
+        # v20 quality metrics: closer to the reference dashboard.
+        # Quality rates use air/competitive contact instead of every ground ball.
+        is_air = la >= 10
+        is_fb = la >= 25
+        if is_air:
+            p["air_bip"] += 1
         if ev >= 95:
             p["hard_hit"] += 1
+            if is_air:
+                p["hard_air"] += 1
         if 8 <= la <= 32:
             p["sweet"] += 1
-        if la >= 25:
+            if is_air:
+                p["sweet_air"] += 1
+        if is_fb:
             p["fb"] += 1
         if is_barrel(row, ev, la):
             p["barrels"] += 1
-            if is_pulled_barrel(row, ev, la):
+            # pulled barrel is only useful if it is airborne / HR-shaped.
+            if is_air and is_pulled_barrel(row, ev, la):
                 p["pulled_barrels"] += 1
         if event == "home_run":
             p["recent_hr"] += 1
@@ -399,11 +410,12 @@ def finalize(p):
         "avgEV": round(p["ev_sum"] / p["ev_count"], 1) if p["ev_count"] else None,
         "maxEV": round(p["max_ev"], 1) if p["max_ev"] is not None else None,
         "LA": round(p["la_sum"] / p["la_count"], 1) if p["la_count"] else None,
-        "HH": round((p["hard_hit"] / bip) * 100, 1) if bip else None,
-        "sweetSpot": round((p["sweet"] / bip) * 100, 1) if bip else None,
-        "FB": round((p["fb"] / bip) * 100, 1) if bip else None,
+        # Display metrics are intentionally air-contact focused, matching the reference table better.
+        "HH": round((p["hard_air"] / p["air_bip"]) * 100, 1) if p.get("air_bip") else (round((p["hard_hit"] / bip) * 100, 1) if bip else None),
+        "sweetSpot": round((p["sweet_air"] / p["air_bip"]) * 100, 1) if p.get("air_bip") else (round((p["sweet"] / bip) * 100, 1) if bip else None),
+        "FB": round((p["fb"] / p["air_bip"]) * 100, 1) if p.get("air_bip") else (round((p["fb"] / bip) * 100, 1) if bip else None),
         "brlBip": round((p["barrels"] / bip) * 100, 1) if bip else None,
-        "pulledBrl": round((p["pulled_barrels"] / bip) * 100, 1) if bip else None,
+        "pulledBrl": round((p["pulled_barrels"] / p["air_bip"]) * 100, 1) if p.get("air_bip") else (round((p["pulled_barrels"] / bip) * 100, 1) if bip else None),
         "nearHR": p["near_hr"],
         "recentHR": p["recent_hr"],
         "lastHREV": round(p["last_hr_ev"], 1) if p["last_hr_ev"] is not None else None,
@@ -415,7 +427,7 @@ def finalize(p):
 def save_partial(raw, start_date, end_date, chunks_done, chunks_total):
     profiles = {pid: finalize(p) for pid, p in raw.items()}
     payload = {
-        "source": "Baseball Savant Statcast long cache, v18 event-derived ISO",
+        "source": "Baseball Savant Statcast long cache, v20 air-contact metrics",
         "generatedAt": datetime.now(TZ).isoformat(),
         "dateRange": {"start": start_date, "end": end_date},
         "chunksDone": chunks_done,
@@ -522,63 +534,69 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     swstr = safe_float(profile.get("swStr"), 10)
     p_hr9 = safe_float(opp_hr9, 1.0)
 
-    # v19: tuned from your reference rows.
-    # kHR is power-quality: xwOBAcon, Brl/BIP and HH% matter more than ISO.
-    brl_exp = (max(brl, 0) ** 1.22) * 0.78
-    xcon_boost = max(0, (safe_float(xwobacon, 0.330) - 0.320)) * 78
-    xwoba_boost = max(0, (safe_float(xwoba, 0.300) - 0.300)) * 38
+    # v20: reference-style air-contact model.
+    # Big drivers: xwOBAcon, barrel rate, pulled air barrels, hard air contact.
+    brl_exp = (max(brl, 0) ** 1.24) * 0.80
+    xcon_boost = max(0, (safe_float(xwobacon, 0.330) - 0.320)) * 82
+    xwoba_boost = max(0, (safe_float(xwoba, 0.300) - 0.300)) * 34
 
     elite_combo = 0
     if brl >= 14 and safe_float(xwobacon, 0) >= .420:
         elite_combo += 6
     if hh >= 55 and safe_float(xwobacon, 0) >= .430:
-        elite_combo += 4
+        elite_combo += 5
     if brl >= 17:
         elite_combo += 3
+    if pulled >= 10 and brl >= 14:
+        elite_combo += 3
 
-    raw = 24
+    raw = 23
     raw += brl_exp
-    raw += scale(pulled, 1, 11) * 7
+    raw += scale(pulled, 1, 12) * 8
     raw += xcon_boost
     raw += xwoba_boost
-    raw += scale(hh, 28, 60) * 9
-    raw += scale(sweet, 25, 46) * 4
-    raw += scale(fb, 15, 40) * 3
+    raw += scale(hh, 32, 62) * 10
+    raw += scale(sweet, 26, 45) * 4
+    raw += scale(fb, 20, 55) * 4
     raw += scale(max_ev, 96, 116) * 4
-    raw += scale(iso, .070, .280) * 4
-    raw += scale(hr_rate, .005, .060) * 3
+    raw += scale(iso, .070, .280) * 3
+    raw += scale(hr_rate, .005, .060) * 2
     raw += min(5, max(0, p_hr9 - .8) * 3.5)
     raw += elite_combo
 
-    # Swing-and-miss suppresses Jordan Walker type profiles.
+    # High whiff lowers kHR/likely, but elite contact can survive it.
     raw -= scale(swstr, 10, 19) * 8
 
     bip = safe_float(profile.get("BIP"), 0)
-    confidence = clamp(bip / 450, 0.72 if cache_hit else 0.65, 1)
-    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 82), 3)
+    confidence = clamp(bip / 425, 0.72 if cache_hit else 0.65, 1)
+    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 84), 3)
 
     pitcher_boost = min(4, max(0, p_hr9 - .8) * 3)
     matchup = round(clamp(khr + pitcher_boost + scale(xwobacon, .340, .480) * 7 - 7, 0, 90), 3)
     test_score = round(clamp(khr + scale(brl, 3, 18) * 5 + scale(xwobacon, .340, .480) * 4 - 8, 0, 90), 3)
 
-    # Ceiling is upside: xwOBAcon, HH%, barrel rate and max EV drive it harder.
     ceiling = round(clamp(
         18
         + scale(max_ev, 96, 116) * 18
         + scale(brl, 3, 18) * 22
-        + scale(hh, 30, 60) * 16
+        + scale(hh, 32, 62) * 18
         + scale(xwobacon, .320, .500) * 22
-        + scale(iso, .070, .280) * 5,
+        + scale(pulled, 1, 12) * 5
+        + scale(iso, .070, .280) * 4,
         8, 99
     ), 3)
 
     zone_fit = round(clamp(
-        0.030 + (brl * 0.0022) + (pulled * 0.0014) + scale(xwobacon, .340, .480) * 0.025 + (0.008 if 12 <= la <= 28 else 0),
+        0.026
+        + (brl * 0.0019)
+        + (pulled * 0.0018)
+        + scale(xwobacon, .340, .480) * 0.022
+        + (0.006 if 12 <= la <= 28 else 0),
         0.020, 0.160
     ), 3)
 
-    # Likely is probability-like; not equal to kHR.
-    likely = round(clamp((khr * 0.55) + scale(xwobacon, .340, .480) * 12 - scale(swstr, 10, 19) * 6, 1, 65), 0)
+    # Likely is intentionally lower/tighter than kHR, based on examples.
+    likely = round(clamp((khr * 0.50) + scale(xwobacon, .340, .480) * 10 - scale(swstr, 10, 19) * 7, 1, 65), 0)
 
     fallback_xwoba = round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None
     fallback_xwobacon = round(max(0.280, min(0.500, 0.300 + (slg * 0.18) + (iso * 0.30))), 3) if ab else None
@@ -681,7 +699,7 @@ def collect_hitter_rows(game_pk: int):
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v19 elite-contact calibration", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v20 air-contact calibration", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -699,7 +717,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v19 elite-contact calibration + Statcast event ISO",
+        "source": "v20 air-contact metrics + Statcast event ISO",
         "hitters": hitters,
     }
 
