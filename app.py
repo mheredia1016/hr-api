@@ -326,3 +326,28 @@ def top_hr(limit: int = 25):
             continue
     out.sort(key=lambda r: r.get("khr", 0), reverse=True)
     return {"date": today_str(), "updatedAt": datetime.now(TZ).isoformat(), "rows": out[:limit]}
+
+# Compatibility routes for dashboard/API testing
+@app.get('/')
+def root():
+    return {
+        "ok": True,
+        "name": "MLB HR Dashboard API",
+        "routes": ["/health", "/games", "/game/{game_pk}", "/top-hr", "/api/games", "/api/game/{game_pk}", "/api/top-hr"],
+    }
+
+@app.get('/api/health')
+def api_health():
+    return health()
+
+@app.get('/api/games')
+def api_games():
+    return games()
+
+@app.get('/api/game/{game_pk}')
+def api_game(game_pk: int):
+    return game(game_pk)
+
+@app.get('/api/top-hr')
+def api_top_hr(limit: int = 25):
+    return top_hr(limit)
