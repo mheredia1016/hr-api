@@ -33,6 +33,7 @@ STATCAST_DAYS = int(os.getenv("STATCAST_DAYS", "30"))
 
 cache_build_lock = threading.Lock()
 cache_build_started_at = None
+last_cache_error = None
 
 TEAM_ABBR_BY_ID = {
     108: "LAA", 109: "AZ", 110: "BAL", 111: "BOS", 112: "CHC",
@@ -219,7 +220,7 @@ def pitcher_hr9(pitcher_id):
     return round((hr / ip) * 9, 2) if ip > 0 else None
 
 def cache_file():
-    return CACHE_DIR / f"statcast_profiles_v12_{current_season()}_{day_str(0)}.json"
+    return CACHE_DIR / f"statcast_profiles_v14_{current_season()}_{day_str(0)}.json"
 
 def cache_is_fresh():
     path = cache_file()
@@ -240,24 +241,31 @@ def load_statcast_cache():
 
 def cache_meta():
     path = cache_file()
+    base = {
+        "building": cache_build_lock.locked(),
+        "buildStartedAt": cache_build_started_at,
+        "lastError": last_cache_error,
+    }
     if not path.exists():
-        return {"exists": False, "fresh": False, "building": cache_build_lock.locked()}
+        return {**base, "exists": False, "fresh": False}
     try:
         data = json.loads(path.read_text())
         age_hours = round((time.time() - path.stat().st_mtime) / 3600, 2)
         return {
+            **base,
             "exists": True,
-            "fresh": age_hours <= CACHE_MAX_AGE_HOURS,
-            "building": cache_build_lock.locked(),
+            "fresh": cache_is_fresh(),
             "ageHours": age_hours,
             "profileCount": len(data.get("profiles", {})),
             "dateRange": data.get("dateRange"),
             "source": data.get("source"),
+            "file": path.name,
         }
     except Exception:
-        return {"exists": True, "fresh": False, "error": "Could not read cache"}
+        return {**base, "exists": True, "fresh": False, "error": "Could not read cache"}
 
 def savant_csv_rows(start_date, end_date, timeout=90):
+    # Important: Baseball Savant date params are inclusive-ish; end_date is yesterday.
     url = "https://baseballsavant.mlb.com/statcast_search/csv"
     params = {
         "all": "true",
@@ -276,20 +284,11 @@ def savant_csv_rows(start_date, end_date, timeout=90):
     r.raise_for_status()
     text = r.text
     if "player_name" not in text[:5000]:
-        return []
+        raise RuntimeError(f"Savant CSV returned unexpected response: {text[:120]}")
     return list(csv.DictReader(StringIO(text)))
 
 def is_barrel(ev, la):
     return safe_float(ev) >= 98 and 8 <= safe_float(la, -999) <= 32
-
-def save_statcast_cache(profiles, start_date, end_date):
-    payload = {
-        "source": "Baseball Savant Statcast CSV, rolling 30/14/7 pregame windows",
-        "generatedAt": datetime.now(TZ).isoformat(),
-        "dateRange": {"start": start_date, "end": end_date},
-        "profiles": {str(k): v for k, v in profiles.items()},
-    }
-    cache_file().write_text(json.dumps(payload))
 
 def empty_raw():
     return {
@@ -364,11 +363,21 @@ def finalize_raw(p):
         "swStr": round((p["swinging_strikes"] / pitches) * 100, 1) if pitches else None,
     }
 
-def build_statcast_cache(days=STATCAST_DAYS):
-    global cache_build_started_at
+def save_statcast_cache(profiles, start_date, end_date):
+    payload = {
+        "source": "Baseball Savant Statcast CSV, rolling 30/14/7 pregame windows",
+        "generatedAt": datetime.now(TZ).isoformat(),
+        "dateRange": {"start": start_date, "end": end_date},
+        "profiles": {str(k): v for k, v in profiles.items()},
+    }
+    cache_file().write_text(json.dumps(payload))
+
+def build_statcast_cache(days=30):
+    global cache_build_started_at, last_cache_error
     if not cache_build_lock.acquire(blocking=False):
         return {"ok": False, "message": "Already building"}
     cache_build_started_at = datetime.now(TZ).isoformat()
+    last_cache_error = None
     try:
         end_date = day_str(1)
         start_date = (now_ct() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -399,8 +408,6 @@ def build_statcast_cache(days=STATCAST_DAYS):
             r30 = finalize_raw(group["r30"])
             r14 = finalize_raw(group["r14"])
             r7 = finalize_raw(group["r7"])
-
-            # Display primarily rolling 30, but form uses 14/7.
             profiles[pid] = {
                 **r30,
                 "r14": r14,
@@ -412,8 +419,9 @@ def build_statcast_cache(days=STATCAST_DAYS):
             }
 
         save_statcast_cache(profiles, start_date, end_date)
-        return {"ok": True, "profileCount": len(profiles), "start": start_date, "end": end_date}
+        return {"ok": True, "profileCount": len(profiles), "start": start_date, "end": end_date, "rawRows": len(rows)}
     except Exception as exc:
+        last_cache_error = str(exc)
         return {"ok": False, "error": str(exc)}
     finally:
         cache_build_lock.release()
@@ -424,30 +432,6 @@ def ensure_cache_background():
     thread = threading.Thread(target=build_statcast_cache, daemon=True)
     thread.start()
     return True
-
-def profile_from_season(stat):
-    ab = safe_float(stat.get("atBats"), 0)
-    hr = safe_float(stat.get("homeRuns"), 0)
-    hits = safe_float(stat.get("hits"), 0)
-    doubles = safe_float(stat.get("doubles"), 0)
-    triples = safe_float(stat.get("triples"), 0)
-    so = safe_float(stat.get("strikeOuts"), 0)
-    tb = safe_float(stat.get("totalBases"), hits + doubles + (2 * triples) + (3 * hr))
-    iso = ((tb / ab) - (hits / ab)) if ab else 0
-    hr_rate = (hr / ab) if ab else 0
-    return {
-        "pitches": safe_int(stat.get("numberOfPitches"), 0),
-        "BIP": max(0, int(ab - so)),
-        "HH": round(min(58, max(24, 30 + iso * 90)), 1),
-        "FB": round(min(50, max(23, 29 + hr_rate * 280)), 1),
-        "brlBip": round(min(20, max(2.5, iso * 48)), 1),
-        "sweetSpot": round(min(46, max(27, 32 + iso * 38)), 1),
-        "pulledBrl": round(min(12, max(1.8, min(20, max(2.5, iso * 48)) * 0.58)), 1),
-        "LA": round(min(25, max(9, 11 + iso * 42)), 1),
-        "nearHR": 0, "recentHR": 0, "formHR7": 0, "formNear7": 0,
-        "maxEV": None, "lastHREV": None, "xwOBA": None, "xwOBAcon": None,
-        "swStr": round((safe_float(stat.get("strikeOuts"), 0) / safe_float(stat.get("plateAppearances"), 1)) * 100, 1) if safe_float(stat.get("plateAppearances"), 0) else None,
-    }
 
 def season_iso(stat):
     ab = safe_float(stat.get("atBats"), 0)
@@ -460,7 +444,39 @@ def season_iso(stat):
     tb = safe_float(stat.get("totalBases"), hits + doubles + (2 * triples) + (3 * hr))
     return round((tb / ab) - (hits / ab), 3)
 
-def normalized_scores(stat, profile, opp_hr9):
+def profile_from_season(stat):
+    ab = safe_float(stat.get("atBats"), 0)
+    pa = safe_float(stat.get("plateAppearances"), 0)
+    hr = safe_float(stat.get("homeRuns"), 0)
+    hits = safe_float(stat.get("hits"), 0)
+    doubles = safe_float(stat.get("doubles"), 0)
+    triples = safe_float(stat.get("triples"), 0)
+    so = safe_float(stat.get("strikeOuts"), 0)
+    tb = safe_float(stat.get("totalBases"), hits + doubles + (2 * triples) + (3 * hr))
+    iso = ((tb / ab) - (hits / ab)) if ab else 0
+    hr_rate = (hr / ab) if ab else 0
+    brl = min(20, max(2.5, iso * 48))
+    return {
+        "pitches": safe_int(stat.get("numberOfPitches"), 0),
+        "BIP": max(0, int(ab - so)),
+        "HH": round(min(58, max(24, 30 + iso * 90)), 1),
+        "FB": round(min(50, max(23, 29 + hr_rate * 280)), 1),
+        "brlBip": round(brl, 1),
+        "sweetSpot": round(min(46, max(27, 32 + iso * 38)), 1),
+        "pulledBrl": round(min(12, max(1.8, brl * 0.58)), 1),
+        "LA": round(min(25, max(9, 11 + iso * 42)), 1),
+        "nearHR": 0,
+        "recentHR": 0,
+        "formHR7": 0,
+        "formNear7": 0,
+        "maxEV": None,
+        "lastHREV": None,
+        "xwOBA": None,
+        "xwOBAcon": None,
+        "swStr": round((so / pa) * 100, 1) if pa else None,
+    }
+
+def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     iso = season_iso(stat) or 0
     hr = safe_float(stat.get("homeRuns"), 0)
     ab = safe_float(stat.get("atBats"), 0)
@@ -479,56 +495,59 @@ def normalized_scores(stat, profile, opp_hr9):
     xwobacon = profile.get("xwOBAcon")
     recent_hr = safe_float(profile.get("recentHR"), 0)
     near = safe_float(profile.get("nearHR"), 0)
-    form_hr7 = safe_float(profile.get("formHR7"), 0)
-    form_near7 = safe_float(profile.get("formNear7"), 0)
     p_hr9 = safe_float(opp_hr9, 1.0)
 
+    # Calibrated closer to reference: mid bats 35-55, top bats 55-70.
+    base = 30
     power = (
-        scale(iso, .080, .300) * 18 +
-        scale(hr_rate, .010, .085) * 10 +
-        scale(brl, 4, 18) * 18 +
-        scale(pulled, 2, 10) * 8 +
-        scale(hh, 32, 58) * 10 +
-        scale(max_ev, 96, 115) * 8
+        scale(iso, .060, .260) * 12 +
+        scale(hr_rate, .005, .070) * 7 +
+        scale(brl, 3, 15) * 10 +
+        scale(pulled, 1, 8) * 6 +
+        scale(hh, 28, 55) * 7 +
+        scale(fb, 22, 48) * 5
     )
-
-    contact_quality = (
-        scale(sweet, 28, 46) * 7 +
-        scale(fb, 25, 50) * 7 +
-        (5 if 13 <= la <= 28 else scale(la, 8, 32) * 2)
+    quality = (
+        scale(sweet, 25, 45) * 4 +
+        (3 if 12 <= la <= 28 else 0) +
+        scale(max_ev, 95, 113) * 5
     )
-
-    form = (
-        min(7, recent_hr * 2.2) +
-        min(5, near * 1.5) +
-        min(5, form_hr7 * 2.5) +
-        min(3, form_near7 * 1.5)
-    )
-
-    pitcher = min(7, max(0, p_hr9 - 0.85) * 5)
+    form = min(6, recent_hr * 1.8) + min(4, near * 1.2)
+    pitcher = min(5, max(0, p_hr9 - 0.80) * 4)
 
     expected = 0
     if xwoba:
-        expected += min(4, max(0, (xwoba - .300) * 30))
+        expected += min(3, max(0, (xwoba - .300) * 24))
     if xwobacon:
-        expected += min(5, max(0, (xwobacon - .340) * 28))
+        expected += min(3, max(0, (xwobacon - .340) * 20))
 
-    raw = 18 + power + contact_quality + form + pitcher + expected
+    raw = base + power + quality + form + pitcher + expected
 
-    # Regression keeps scale similar to reference dashboard.
-    sample_bip = safe_float(profile.get("BIP"), 0)
-    confidence = clamp(sample_bip / 120, 0.35, 1.0)
-    regressed = (raw * confidence) + (42 * (1 - confidence))
-    khr = round(clamp(regressed, 5, 78), 3)
+    bip = safe_float(profile.get("BIP"), 0)
+    confidence = clamp(bip / 120, 0.40 if cache_hit else 0.62, 1.0)
+    anchor = 42 if cache_hit else 38
+    khr = round(clamp((raw * confidence) + (anchor * (1 - confidence)), 12, 74), 3)
 
-    matchup = round(clamp(khr + pitcher - 2.5, 0, 80), 3)
-    test_score = round(clamp(khr - 0.5 + scale(brl, 4, 18) * 2, 0, 80), 3)
+    # Reference columns have Matchup/Test Score slightly above/below kHR.
+    matchup = round(clamp(khr + pitcher + scale(iso, .080, .260) * 2.5 - 1.8, 0, 80), 3)
+    test_score = round(clamp(khr + scale(brl, 3, 15) * 2.2 - 1.4, 0, 80), 3)
     ceiling = round(clamp(
-        22 + scale(max_ev, 96, 115) * 30 + scale(iso, .080, .300) * 25 + scale(brl, 4, 18) * 18 + min(8, near * 2),
-        5, 99
+        18 + scale(max_ev, 95, 113) * 22 + scale(iso, .060, .260) * 18 + scale(brl, 3, 15) * 12 + min(5, near * 1.2),
+        10, 99
     ), 3)
-    zone_fit = round(clamp(0.040 + (brl * 0.0025) + (pulled * 0.0015) + (0.012 if 13 <= la <= 28 else 0), 0.030, 0.160), 3)
-    likely = round(clamp(khr * 0.72, 1, 65), 0)
+
+    # IMPORTANT: Reference screenshot zone is 0.500 style.
+    # Scale to 0.000-0.500ish. Average/unknown fallback lands 0.050-0.180, great spots 0.300-0.500.
+    zone_fit = round(clamp(
+        (scale(brl, 3, 15) * 0.180) +
+        (scale(pulled, 1, 8) * 0.130) +
+        (scale(sweet, 25, 45) * 0.080) +
+        (0.060 if 12 <= la <= 28 else 0.015) +
+        (scale(max_ev, 95, 113) * 0.070),
+        0.015, 0.500
+    ), 3)
+
+    likely = round(clamp(khr * 0.82, 1, 70), 0)
 
     fallback_xwoba = round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None
     fallback_xwobacon = round(max(0.280, min(0.500, 0.300 + (slg * 0.18) + (iso * 0.30))), 3) if ab else None
@@ -545,27 +564,35 @@ def normalized_scores(stat, profile, opp_hr9):
         "likely": likely,
     }
 
+def hr_form(stat, profile, source):
+    if source == "Statcast cache":
+        recent_hr = safe_int(profile.get("recentHR"), 0)
+        near = safe_int(profile.get("nearHR"), 0)
+        form7 = safe_int(profile.get("formHR7"), 0)
+        form_near7 = safe_int(profile.get("formNear7"), 0)
+        score = clamp(34 + recent_hr * 7 + near * 3 + form7 * 9 + form_near7 * 4, 18, 82)
+        arrow = "↑" if form7 or form_near7 else ("→" if recent_hr or near else "↓")
+        return f"{int(score)}% {arrow}"
+
+    ab = safe_float(stat.get("atBats"), 0)
+    hr = safe_float(stat.get("homeRuns"), 0)
+    rate = hr / ab if ab else 0
+    score = clamp(28 + rate * 520 + min(12, hr * .35), 18, 74)
+    arrow = "↑" if rate >= .055 else ("→" if rate >= .030 else "↓")
+    return f"{int(score)}% {arrow}"
+
 def hitter_row(player, team, opp_pitcher, profiles):
     pid = player.get("playerId")
     stat = hitter_season_stats(int(pid), current_season()) if pid else {}
-    profile = profiles.get(int(pid)) if pid else None
-    source = "Statcast rolling cache"
-    if not profile:
-        profile = profile_from_season(stat)
-        source = "Season estimate fallback"
+    cache_hit = bool(pid and int(pid) in profiles)
+    profile = profiles.get(int(pid)) if cache_hit else profile_from_season(stat)
+    source = "Statcast cache" if cache_hit else "Season fallback"
 
     opp_hr9 = pitcher_hr9(opp_pitcher.get("id")) if opp_pitcher else None
-    scores = normalized_scores(stat, profile, opp_hr9)
+    scores = calibrated_scores(stat, profile, opp_hr9, cache_hit)
 
     pa = safe_int(stat.get("plateAppearances"), 0)
     so = safe_int(stat.get("strikeOuts"), 0)
-    hr = safe_int(stat.get("homeRuns"), 0)
-
-    recent_hr = safe_int(profile.get("recentHR"), 0)
-    near_hr = safe_int(profile.get("nearHR"), 0)
-    arrow = "↑" if recent_hr or near_hr else "→"
-    hr_form = f"{min(99, 35 + recent_hr * 10 + near_hr * 4)}% {arrow}"
-
     return {
         "playerId": pid,
         "name": player.get("name", "Unknown"),
@@ -573,15 +600,13 @@ def hitter_row(player, team, opp_pitcher, profiles):
         "teamLogo": team_logo(team.get("abbreviation", "MLB")),
         "headshot": player_headshot(pid),
         "pitcher": (opp_pitcher or {}).get("fullName") or (opp_pitcher or {}).get("name") or "TBD",
-
         "AB": safe_int(stat.get("atBats"), 0),
         "PA": pa,
         "H": safe_int(stat.get("hits"), 0),
-        "HR": hr,
+        "HR": safe_int(stat.get("homeRuns"), 0),
         "RBI": safe_int(stat.get("rbi"), 0),
         "BB": safe_int(stat.get("baseOnBalls"), 0),
         "SO": so,
-
         "pitches": profile.get("pitches") or safe_int(stat.get("numberOfPitches"), 0),
         "BIP": profile.get("BIP"),
         "ISO": scores["ISO"],
@@ -594,18 +619,18 @@ def hitter_row(player, team, opp_pitcher, profiles):
         "FB": profile.get("FB"),
         "HH": profile.get("HH"),
         "LA": profile.get("LA"),
-        "nearHR": near_hr,
+        "nearHR": safe_int(profile.get("nearHR"), 0),
         "maxEV": profile.get("maxEV"),
         "lastHREV": profile.get("lastHREV"),
-
         "matchup": scores["matchup"],
         "testScore": scores["testScore"],
         "ceiling": scores["ceiling"],
         "zoneFit": scores["zoneFit"],
-        "hrForm": hr_form,
+        "hrForm": hr_form(stat, profile, source),
         "kHR": scores["kHR"],
         "likely": scores["likely"],
         "status": source,
+        "cacheHit": cache_hit,
     }
 
 def collect_hitter_rows(game_pk: int):
@@ -630,7 +655,7 @@ def collect_hitter_rows(game_pk: int):
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "Normalized HR API v12", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v14 calibrated + debug", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -643,18 +668,20 @@ def games():
 @app.get("/api/game/{game_pk}")
 def game_detail(game_pk: int):
     hitters = collect_hitter_rows(game_pk)
+    cache_hits = sum(1 for h in hitters if h.get("cacheHit"))
     return {
         "gamePk": game_pk,
         "count": len(hitters),
+        "cacheHits": cache_hits,
         "cache": cache_meta(),
-        "source": "Normalized rolling Statcast cache if ready; season fallback while building",
+        "source": "v14 calibrated: Statcast cache if available; fallback if not",
         "hitters": hitters,
     }
 
 @app.get("/api/cache/build")
 @app.post("/api/cache/build")
-def cache_build():
-    result = build_statcast_cache()
+def cache_build(days: int = 30):
+    result = build_statcast_cache(days=days)
     return {**result, "cache": cache_meta()}
 
 @app.get("/api/cache/build-background")
@@ -667,3 +694,16 @@ def cache_build_background():
 def cache_status():
     ensure_cache_background()
     return cache_meta()
+
+@app.get("/api/debug/player/{player_id}")
+def debug_player(player_id: int):
+    profiles = load_statcast_cache()
+    stat = hitter_season_stats(player_id, current_season())
+    profile = profiles.get(player_id)
+    return {
+        "playerId": player_id,
+        "cacheHit": player_id in profiles,
+        "seasonStats": stat,
+        "statcastProfile": profile,
+        "cache": cache_meta(),
+    }
