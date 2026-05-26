@@ -124,19 +124,8 @@ def normalize_game(game):
     }
 
 def get_games_raw(date_str):
-    try:
-        data = get_json(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher")
-        games = []
-        for db in data.get("dates", []):
-            for game in db.get("games", []):
-                try:
-                    games.append(normalize_game(game))
-                except Exception as exc:
-                    print(f"[WARN] Failed to normalize game: {exc}")
-        return games
-    except Exception as exc:
-        print(f"[ERROR] get_games_raw failed for {date_str}: {exc}")
-        return []
+    data = get_json(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher")
+    return [normalize_game(game) for db in data.get("dates", []) for game in db.get("games", [])]
 
 def get_game_by_pk(game_pk: int):
     for url in [
@@ -857,22 +846,14 @@ def pitcher_report():
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v23 games endpoint fix + kHR formula", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v22 kHR formula update + pitcher reports", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
 def games():
-    try:
-        ensure_cache_background()
-    except Exception as exc:
-        print(f"[WARN] ensure_cache_background failed: {exc}")
+    ensure_cache_background()
     d = day_str(0)
-    try:
-        games_list = get_games_raw(d)
-    except Exception as exc:
-        print(f"[ERROR] /api/games failed: {exc}")
-        games_list = []
-    return {"date": d, "games": games_list, "count": len(games_list), "cache": cache_meta()}
+    return {"date": d, "games": get_games_raw(d), "cache": cache_meta()}
 
 @app.get("/game/{game_pk}")
 @app.get("/api/game/{game_pk}")
