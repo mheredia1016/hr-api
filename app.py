@@ -225,7 +225,7 @@ def cache_meta():
         "buildStartedAt": cache_build_started_at,
         "lastError": last_cache_error,
         "lookbackDays": LOOKBACK_DAYS,
-        "note": "v20 recalculates HH/SweetSpot/PulledBrl using air-contact definitions and lowers Likely scaling."
+        "note": "v22 kHR includes hitter quality, matchup boost, and recent form; frontend should not double-count Matchup."
     }
     if not path.exists():
         return {**base, "exists": False, "fresh": False}
@@ -534,47 +534,77 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     swstr = safe_float(profile.get("swStr"), 10)
     p_hr9 = safe_float(opp_hr9, 1.0)
 
-    # v20: reference-style air-contact model.
-    # Big drivers: xwOBAcon, barrel rate, pulled air barrels, hard air contact.
-    brl_exp = (max(brl, 0) ** 1.24) * 0.80
-    xcon_boost = max(0, (safe_float(xwobacon, 0.330) - 0.320)) * 82
-    xwoba_boost = max(0, (safe_float(xwoba, 0.300) - 0.300)) * 34
+    recent_hr = safe_float(profile.get("recentHR"), 0)
+    near_hr = safe_float(profile.get("nearHR"), 0)
 
-    elite_combo = 0
+    # v22 kHR formula:
+    # kHR now includes matchup + recent form/hot bat, so the frontend should not
+    # separately double-count Matchup in Best Matchups.
+    contact_score = 0
+    contact_score += scale(xwobacon, .320, .500) * 26
+    contact_score += scale(xwoba, .300, .450) * 12
+    contact_score += scale(brl, 3, 18) * 18
+    contact_score += scale(pulled, 1, 12) * 10
+    contact_score += scale(hh, 32, 62) * 11
+    contact_score += scale(iso, .070, .280) * 8
+    contact_score += scale(max_ev, 96, 116) * 5
+    contact_score += scale(sweet, 26, 45) * 4
+    contact_score += scale(fb, 20, 55) * 3
+
+    # Matchup boost from pitcher HR risk. Conservative, so weak pitchers help but do not dominate.
+    matchup_boost = 0
+    matchup_boost += max(0, p_hr9 - .80) * 5.5
+    matchup_boost = min(matchup_boost, 8)
+
+    # Recent form / hot bat boost from Statcast cache.
+    # This stays small because HR props can get noisy fast.
+    form_boost = 0
+    form_boost += min(5, recent_hr * 1.4)
+    form_boost += min(4, near_hr * 0.9)
+
+    # Elite profile combo boosts. This helps Yordan/Judge/Ohtani type hitters separate.
+    elite_boost = 0
     if brl >= 14 and safe_float(xwobacon, 0) >= .420:
-        elite_combo += 6
+        elite_boost += 5
     if hh >= 55 and safe_float(xwobacon, 0) >= .430:
-        elite_combo += 5
+        elite_boost += 4
     if brl >= 17:
-        elite_combo += 3
+        elite_boost += 3
     if pulled >= 10 and brl >= 14:
-        elite_combo += 3
+        elite_boost += 2
 
-    raw = 23
-    raw += brl_exp
-    raw += scale(pulled, 1, 12) * 8
-    raw += xcon_boost
-    raw += xwoba_boost
-    raw += scale(hh, 32, 62) * 10
-    raw += scale(sweet, 26, 45) * 4
-    raw += scale(fb, 20, 55) * 4
-    raw += scale(max_ev, 96, 116) * 4
-    raw += scale(iso, .070, .280) * 3
-    raw += scale(hr_rate, .005, .060) * 2
-    raw += min(5, max(0, p_hr9 - .8) * 3.5)
-    raw += elite_combo
+    swstr_penalty = scale(swstr, 10, 19) * 8
 
-    # High whiff lowers kHR/likely, but elite contact can survive it.
-    raw -= scale(swstr, 10, 19) * 8
+    raw_khr = 24 + contact_score + matchup_boost + form_boost + elite_boost - swstr_penalty
 
     bip = safe_float(profile.get("BIP"), 0)
     confidence = clamp(bip / 425, 0.72 if cache_hit else 0.65, 1)
-    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 84), 3)
+    khr = round(clamp((raw_khr * confidence) + (40 * (1 - confidence)), 5, 84), 3)
 
-    pitcher_boost = min(4, max(0, p_hr9 - .8) * 3)
-    matchup = round(clamp(khr + pitcher_boost + scale(xwobacon, .340, .480) * 7 - 7, 0, 90), 3)
-    test_score = round(clamp(khr + scale(brl, 3, 18) * 5 + scale(xwobacon, .340, .480) * 4 - 8, 0, 90), 3)
+    # Matchup column = how good the hitter's profile fits the opposing pitcher.
+    # It is related to kHR but not identical.
+    matchup = round(clamp(
+        28
+        + scale(xwobacon, .330, .480) * 20
+        + scale(brl, 3, 18) * 16
+        + scale(pulled, 1, 12) * 8
+        + matchup_boost * 2.2
+        - scale(swstr, 10, 19) * 6,
+        0, 90
+    ), 3)
 
+    # Test Score = hitter-only contact quality test.
+    test_score = round(clamp(
+        26
+        + scale(xwobacon, .320, .500) * 24
+        + scale(brl, 3, 18) * 20
+        + scale(hh, 32, 62) * 12
+        + scale(iso, .070, .280) * 6
+        - scale(swstr, 10, 19) * 7,
+        0, 90
+    ), 3)
+
+    # Ceiling = upside if he connects.
     ceiling = round(clamp(
         18
         + scale(max_ev, 96, 116) * 18
@@ -595,7 +625,7 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
         0.020, 0.160
     ), 3)
 
-    # Likely is intentionally lower/tighter than kHR, based on examples.
+    # Likely = probability-like output, intentionally lower/tighter than kHR.
     likely = round(clamp((khr * 0.50) + scale(xwobacon, .340, .480) * 10 - scale(swstr, 10, 19) * 7, 1, 65), 0)
 
     fallback_xwoba = round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None
@@ -816,7 +846,7 @@ def pitcher_report():
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v21 hitter + pitcher reports", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v22 kHR formula update + pitcher reports", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -834,7 +864,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v20 air-contact metrics + Statcast event ISO",
+        "source": "v22 kHR includes matchup + recent form + Statcast event ISO",
         "hitters": hitters,
     }
 
