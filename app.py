@@ -534,11 +534,8 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     swstr = safe_float(profile.get("swStr"), 10)
     p_hr9 = safe_float(opp_hr9, 1.0)
 
-    # v22:
-    # Matchup = historical profile fit only, no recent form.
-    # kHR = historical matchup + recent form.
-    # Zone Fit = hitter damage zone vs pitcher weak zone proxy.
-
+    # v20: reference-style air-contact model.
+    # Big drivers: xwOBAcon, barrel rate, pulled air barrels, hard air contact.
     brl_exp = (max(brl, 0) ** 1.24) * 0.80
     xcon_boost = max(0, (safe_float(xwobacon, 0.330) - 0.320)) * 82
     xwoba_boost = max(0, (safe_float(xwoba, 0.300) - 0.300)) * 34
@@ -553,59 +550,52 @@ def calibrated_scores(stat, profile, opp_hr9, cache_hit):
     if pulled >= 10 and brl >= 14:
         elite_combo += 3
 
-    historical_raw = 23
-    historical_raw += brl_exp
-    historical_raw += scale(pulled, 1, 12) * 8
-    historical_raw += xcon_boost
-    historical_raw += xwoba_boost
-    historical_raw += scale(hh, 32, 62) * 10
-    historical_raw += scale(sweet, 26, 45) * 4
-    historical_raw += scale(fb, 20, 55) * 4
-    historical_raw += scale(max_ev, 96, 116) * 4
-    historical_raw += scale(iso, .070, .280) * 3
-    historical_raw += scale(hr_rate, .005, .060) * 2
-    historical_raw += min(5, max(0, p_hr9 - .8) * 3.5)
-    historical_raw += elite_combo
-    historical_raw -= scale(swstr, 10, 19) * 8
+    raw = 23
+    raw += brl_exp
+    raw += scale(pulled, 1, 12) * 8
+    raw += xcon_boost
+    raw += xwoba_boost
+    raw += scale(hh, 32, 62) * 10
+    raw += scale(sweet, 26, 45) * 4
+    raw += scale(fb, 20, 55) * 4
+    raw += scale(max_ev, 96, 116) * 4
+    raw += scale(iso, .070, .280) * 3
+    raw += scale(hr_rate, .005, .060) * 2
+    raw += min(5, max(0, p_hr9 - .8) * 3.5)
+    raw += elite_combo
+
+    # High whiff lowers kHR/likely, but elite contact can survive it.
+    raw -= scale(swstr, 10, 19) * 8
 
     bip = safe_float(profile.get("BIP"), 0)
     confidence = clamp(bip / 425, 0.72 if cache_hit else 0.65, 1)
-    historical_score = clamp((historical_raw * confidence) + (40 * (1 - confidence)), 5, 84)
-
-    recent_hr = safe_float(profile.get("recentHR"), 0)
-    near_hr = safe_float(profile.get("nearHR"), 0)
-    last_hr_ev = safe_float(profile.get("lastHREV"), 0)
-
-    recent_form_boost = min(5, recent_hr * 0.55) + min(4, near_hr * 0.75)
-    if last_hr_ev:
-        recent_form_boost += min(3, max(0, last_hr_ev - 100) * 0.20)
-
-    cold_penalty = 0
-    if recent_hr == 0 and near_hr == 0 and safe_float(xwobacon, 0) < .340:
-        cold_penalty = 3
-
-    khr = round(clamp(historical_score + recent_form_boost - cold_penalty, 5, 88), 3)
+    khr = round(clamp((raw * confidence) + (40 * (1 - confidence)), 5, 84), 3)
 
     pitcher_boost = min(4, max(0, p_hr9 - .8) * 3)
-    matchup = round(clamp(historical_score + pitcher_boost + scale(xwobacon, .340, .480) * 7 - 7, 0, 90), 3)
-    test_score = round(clamp(historical_score + scale(brl, 3, 18) * 5 + scale(xwobacon, .340, .480) * 4 - 8, 0, 90), 3)
+    matchup = round(clamp(khr + pitcher_boost + scale(xwobacon, .340, .480) * 7 - 7, 0, 90), 3)
+    test_score = round(clamp(khr + scale(brl, 3, 18) * 5 + scale(xwobacon, .340, .480) * 4 - 8, 0, 90), 3)
 
     ceiling = round(clamp(
-        18 + scale(max_ev, 96, 116) * 18 + scale(brl, 3, 18) * 22
-        + scale(hh, 32, 62) * 18 + scale(xwobacon, .320, .500) * 22
-        + scale(pulled, 1, 12) * 5 + scale(iso, .070, .280) * 4,
+        18
+        + scale(max_ev, 96, 116) * 18
+        + scale(brl, 3, 18) * 22
+        + scale(hh, 32, 62) * 18
+        + scale(xwobacon, .320, .500) * 22
+        + scale(pulled, 1, 12) * 5
+        + scale(iso, .070, .280) * 4,
         8, 99
     ), 3)
 
-    hitter_damage_zone = (
-        (brl * 0.0016)
+    zone_fit = round(clamp(
+        0.026
+        + (brl * 0.0019)
         + (pulled * 0.0018)
-        + scale(xwobacon, .340, .480) * 0.018
-        + (0.007 if 12 <= la <= 28 else 0)
-    )
-    pitcher_weak_zone = max(0, p_hr9 - .8) * 0.012
-    zone_fit = round(clamp(0.020 + hitter_damage_zone + pitcher_weak_zone, 0.015, 0.175), 3)
+        + scale(xwobacon, .340, .480) * 0.022
+        + (0.006 if 12 <= la <= 28 else 0),
+        0.020, 0.160
+    ), 3)
 
+    # Likely is intentionally lower/tighter than kHR, based on examples.
     likely = round(clamp((khr * 0.50) + scale(xwobacon, .340, .480) * 10 - scale(swstr, 10, 19) * 7, 1, 65), 0)
 
     fallback_xwoba = round(max(0.250, min(0.450, 0.260 + (ops * 0.12) + (iso * 0.25))), 3) if ab else None
@@ -823,10 +813,201 @@ def pitcher_report():
         "weakPitchers": weak,
     }
 
+
+
+@lru_cache(maxsize=128)
+def team_pitching_profile(team_id: int):
+    """
+    Team pitching proxy used as bullpen/team staff damage.
+    MLB public API does not always expose clean bullpen-only contact data,
+    so this uses team pitching skill stats and turns them into HR-risk estimates.
+    """
+    if not team_id:
+        return None
+    try:
+        data = get_json(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&season={current_season()}")
+        splits = (data.get("stats") or [{}])[0].get("splits") or []
+        if not splits:
+            return None
+        stat = splits[0].get("stat") or {}
+    except Exception:
+        return None
+
+    ip = safe_float(stat.get("inningsPitched"), 0)
+    bf = safe_float(stat.get("battersFaced"), 0)
+    so = safe_float(stat.get("strikeOuts"), 0)
+    bb = safe_float(stat.get("baseOnBalls"), 0)
+    hr = safe_float(stat.get("homeRuns"), 0)
+    hits = safe_float(stat.get("hits"), 0)
+    era = safe_float(stat.get("era"), 0)
+    whip = safe_float(stat.get("whip"), 0)
+
+    k_pct = (so / bf) * 100 if bf else 0
+    bb_pct = (bb / bf) * 100 if bf else 0
+    hr9 = (hr / ip) * 9 if ip else 0
+
+    # Estimated team/bullpen contact allowed profile.
+    xwoba = clamp(0.330 - (k_pct - 21) * 0.0026 + (bb_pct - 8) * 0.0028 + (hr9 - 1.0) * 0.030, 0.250, 0.430)
+    swstr = clamp(10 + (k_pct - 20) * 0.22, 6, 17)
+    brl = clamp(6.3 + (hr9 - 1.0) * 3.2 - (k_pct - 20) * 0.04, 2.0, 15.5)
+    fb = clamp(27 + (hr9 - 1.0) * 6.0, 14, 46)
+    hh = clamp(39 + (hits / max(ip, 1) - 1.0) * 8 + (hr9 - 1.0) * 5, 25, 60)
+
+    bullpen_damage = clamp(
+        50
+        + (xwoba - .315) * 95
+        + (brl - 7) * 2.4
+        + (hh - 40) * 0.75
+        + (fb - 28) * 0.45
+        + max(0, hr9 - 1.0) * 10
+        - (swstr - 10) * 1.2,
+        5, 95
+    )
+
+    return {
+        "teamId": team_id,
+        "bullpenDamage": round(bullpen_damage, 1),
+        "bullpenHR9": round(hr9, 2),
+        "bullpenKPercent": round(k_pct, 1),
+        "bullpenBBPercent": round(bb_pct, 1),
+        "bullpenxwOBA": round(xwoba, 3),
+        "bullpenSwStr": round(swstr, 1),
+        "bullpenBrlBip": round(brl, 1),
+        "bullpenFB": round(fb, 1),
+        "bullpenHH": round(hh, 1),
+        "bullpenERA": era,
+        "bullpenWHIP": whip,
+        "source": "team pitching proxy",
+    }
+
+def starter_damage_from_pitcher(pitcher_id):
+    prof = pitcher_skill_profile(pitcher_id)
+    if not prof:
+        return None
+    # Convert pitcher weak profile into a damage score for hitters.
+    return {
+        "starterDamage": prof.get("weakScore"),
+        "starterxwOBA": prof.get("xwOBA"),
+        "starterSwStr": prof.get("swStr"),
+        "starterBrlBip": prof.get("brlBip"),
+        "starterFB": prof.get("FB"),
+        "starterHH": prof.get("HH"),
+        "starterHR9": prof.get("HR9"),
+        "starterName": "",
+    }
+
+def top_targets_for_team(game_pk, team_abbr, limit=3):
+    try:
+        rows = collect_hitter_rows(int(game_pk))
+        team_rows = [r for r in rows if str(r.get("team", "")).upper() == str(team_abbr).upper()]
+        team_rows.sort(key=lambda r: -safe_float(r.get("kHR")))
+        return [
+            {
+                "name": r.get("name"),
+                "team": r.get("team"),
+                "kHR": r.get("kHR"),
+                "xwOBAcon": r.get("xwOBAcon"),
+                "ISO": r.get("ISO"),
+                "HH": r.get("HH"),
+                "swStr": r.get("swStr"),
+                "pitcher": r.get("pitcher"),
+            }
+            for r in team_rows[:limit]
+        ]
+    except Exception:
+        return []
+
+def build_stack_row(game, offense_team, opponent_team, opponent_pitcher):
+    offense_abbr = offense_team.get("abbreviation") or team_abbr(offense_team)
+    opponent_abbr = opponent_team.get("abbreviation") or team_abbr(opponent_team)
+
+    starter_id = (opponent_pitcher or {}).get("id") if isinstance(opponent_pitcher, dict) else None
+    starter = starter_damage_from_pitcher(starter_id) or {
+        "starterDamage": 45,
+        "starterxwOBA": None,
+        "starterSwStr": None,
+        "starterBrlBip": None,
+        "starterFB": None,
+        "starterHH": None,
+        "starterHR9": None,
+    }
+    starter["starterName"] = (opponent_pitcher or {}).get("fullName") or (opponent_pitcher or {}).get("name") or "TBD"
+
+    # Bullpen/team staff belongs to the opponent team.
+    bullpen = team_pitching_profile(int(opponent_team.get("id") or 0)) or {
+        "bullpenDamage": 45,
+        "bullpenHR9": None,
+        "bullpenxwOBA": None,
+        "bullpenSwStr": None,
+        "bullpenBrlBip": None,
+        "bullpenFB": None,
+        "bullpenHH": None,
+        "source": "unavailable",
+    }
+
+    starter_damage = safe_float(starter.get("starterDamage"), 45)
+    bullpen_damage = safe_float(bullpen.get("bullpenDamage"), 45)
+
+    # Combined team HR environment. This is what should drive parlay/stack spots.
+    combined = clamp(
+        (starter_damage * 0.55)
+        + (bullpen_damage * 0.35)
+        + max(0, safe_float(starter.get("starterHH"), 40) - 40) * 0.35
+        + max(0, safe_float(bullpen.get("bullpenHH"), 40) - 40) * 0.25
+        + max(0, safe_float(starter.get("starterBrlBip"), 7) - 7) * 0.9
+        + max(0, safe_float(bullpen.get("bullpenBrlBip"), 7) - 7) * 0.7,
+        1, 99
+    )
+
+    top_targets = top_targets_for_team(game.get("gamePk"), offense_abbr, 3)
+
+    return {
+        "gamePk": game.get("gamePk"),
+        "gameDate": game.get("gameDate"),
+        "matchup": game.get("label"),
+        "team": offense_abbr,
+        "opponent": opponent_abbr,
+        "teamLogo": team_logo(offense_abbr),
+        "opponentLogo": team_logo(opponent_abbr),
+        "starterName": starter.get("starterName"),
+        **starter,
+        **bullpen,
+        "combinedDamage": round(combined, 1),
+        "stackRating": "🔥 Smash" if combined >= 75 else ("💣 Strong" if combined >= 63 else ("🎯 Live" if combined >= 52 else "👀 Lean")),
+        "topTargets": top_targets,
+        "topTargetsText": ", ".join([t.get("name", "") for t in top_targets]) or "—",
+    }
+
+@app.get("/api/stack-spots")
+@app.get("/stack-spots")
+def stack_spots():
+    ensure_cache_background()
+    games_today = get_games_raw(day_str(0))
+    rows = []
+
+    for game in games_today:
+        away = game.get("away") or {}
+        home = game.get("home") or {}
+        away_p = game.get("awayProbablePitcher") or {}
+        home_p = game.get("homeProbablePitcher") or {}
+
+        # Away offense faces home starter + home bullpen.
+        rows.append(build_stack_row(game, away, home, home_p))
+        # Home offense faces away starter + away bullpen.
+        rows.append(build_stack_row(game, home, away, away_p))
+
+    rows.sort(key=lambda r: -safe_float(r.get("combinedDamage")))
+    return {
+        "date": day_str(0),
+        "count": len(rows),
+        "source": "starter damage + team pitching/bullpen proxy + top HR targets",
+        "stackSpots": rows,
+    }
+
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v22 scoring definitions", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v22 hitter + pitcher + stack spots", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -844,7 +1025,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v22: Matchup historical only, kHR includes form, Zone Fit uses batter/pitcher zone proxy",
+        "source": "v20 air-contact metrics + Statcast event ISO",
         "hitters": hitters,
     }
 
