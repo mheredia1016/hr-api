@@ -627,13 +627,36 @@ def hr_form(stat, profile, cache_hit):
     arrow = "↑" if rate >= .055 else ("→" if rate >= .030 else "↓")
     return f"{int(score)}% {arrow}"
 
-def hitter_row(player, team, opp_pitcher, profiles):
+def hitter_row(player, team, opp_team, opp_pitcher, profiles):
     pid = player.get("playerId")
     stat = hitter_season_stats(int(pid), current_season()) if pid else {}
     cache_hit = bool(pid and int(pid) in profiles)
     profile = profiles.get(int(pid)) if cache_hit else fallback_profile(stat)
     opp_hr9 = pitcher_hr9(opp_pitcher.get("id")) if opp_pitcher else None
     scores = calibrated_scores(stat, profile, opp_hr9, cache_hit)
+
+    starter_damage = 45
+    bullpen_damage = 45
+
+    if opp_pitcher and opp_pitcher.get("id"):
+        starter = starter_damage_from_pitcher(opp_pitcher.get("id"))
+        if starter:
+            starter_damage = safe_float(starter.get("starterDamage"), 45)
+
+    if opp_team and opp_team.get("id"):
+        bullpen = team_pitching_profile(int(opp_team.get("id")))
+        if bullpen:
+            bullpen_damage = safe_float(bullpen.get("bullpenDamage"), 45)
+
+    stack_boost = (
+        starter_damage * 0.18
+        + bullpen_damage * 0.12
+    )
+
+    scores["matchup"] = round(clamp(scores["matchup"] + stack_boost, 0, 99), 3)
+    scores["testScore"] = round(clamp(scores["testScore"] + stack_boost, 0, 99), 3)
+    scores["kHR"] = round(clamp(scores["kHR"] + (stack_boost * 0.70), 0, 99), 3)
+
 
     pa = safe_int(stat.get("plateAppearances"), 0)
     so = safe_int(stat.get("strikeOuts"), 0)
@@ -672,6 +695,9 @@ def hitter_row(player, team, opp_pitcher, profiles):
         "zoneFit": scores["zoneFit"],
         "hrForm": hr_form(stat, profile, cache_hit),
         "kHR": scores["kHR"],
+        "starterDamage": round(starter_damage, 1),
+        "bullpenDamage": round(bullpen_damage, 1),
+        "stackBoost": round(stack_boost, 1),
         "likely": scores["likely"],
         "status": "Statcast ISO cache" if cache_hit else "Season fallback",
         "cacheHit": cache_hit,
@@ -690,9 +716,25 @@ def collect_hitter_rows(game_pk: int):
 
     rows = []
     for p in active_roster(int(away.get("id") or 0)):
-        rows.append(hitter_row(p, away, home_pitcher, profiles))
+        rows.append(
+            hitter_row(
+                p,
+                away,
+                home,
+                home_pitcher,
+                profiles
+            )
+        )
     for p in active_roster(int(home.get("id") or 0)):
-        rows.append(hitter_row(p, home, away_pitcher, profiles))
+        rows.append(
+            hitter_row(
+                p,
+                home,
+                away,
+                away_pitcher,
+                profiles
+            )
+        )
     rows.sort(key=lambda r: (-safe_float(r.get("kHR")), r.get("team", ""), r.get("name", "")))
     return rows
 
@@ -1007,7 +1049,7 @@ def stack_spots():
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v22 hitter + pitcher + stack spots", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v23 stack-boosted hitter scores", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -1025,7 +1067,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v20 air-contact metrics + Statcast event ISO",
+        "source": "v23 stack-boosted hitter scores + Statcast event ISO",
         "hitters": hitters,
     }
 
