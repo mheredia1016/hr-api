@@ -132,11 +132,14 @@ def player_id_int(x):
 
 def get_official_lineups(game_pk):
     """
-    MLB live feed battingOrder filter.
-    If confirmed, only players listed in the official batting order are returned.
+    Reads MLB live feed official battingOrder.
+    Returns confirmed=True only when both sides have 8+ official starters.
     """
     try:
-        data = get_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live", timeout=25)
+        data = get_json(
+            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+            timeout=25
+        )
         box = (((data.get("liveData") or {}).get("boxscore") or {}).get("teams") or {})
         out = {"confirmed": False, "away": {}, "home": {}}
 
@@ -147,17 +150,22 @@ def get_official_lineups(game_pk):
 
             for idx, pid_raw in enumerate(order):
                 pid = player_id_int(pid_raw)
-                if pid:
-                    pdata = players.get(f"ID{pid}", {}) or {}
-                    person = pdata.get("person") or {}
-                    pos = (pdata.get("position") or {}).get("abbreviation", "")
-                    out[side][pid] = {
-                        "playerId": pid,
-                        "name": person.get("fullName") or person.get("boxscoreName") or str(pid),
-                        "position": pos,
-                        "lineupSpot": idx + 1,
-                    }
+                if not pid:
+                    continue
 
+                pdata = players.get(f"ID{pid}", {}) or {}
+                person = pdata.get("person") or {}
+                pos = (pdata.get("position") or {}).get("abbreviation", "")
+
+                out[side][pid] = {
+                    "playerId": pid,
+                    "name": person.get("fullName") or person.get("boxscoreName") or str(pid),
+                    "position": pos,
+                    "lineupSpot": idx + 1,
+                    "lineupStatus": "confirmed",
+                }
+
+            # Fallback for games where players have battingOrder but battingOrder list is odd.
             for key, pdata in players.items():
                 person = pdata.get("person") or {}
                 pid = player_id_int(person.get("id") or str(key).replace("ID", ""))
@@ -174,12 +182,13 @@ def get_official_lineups(game_pk):
                             "name": person.get("fullName") or person.get("boxscoreName") or str(pid),
                             "position": pos,
                             "lineupSpot": spot,
+                            "lineupStatus": "confirmed",
                         }
 
         out["confirmed"] = len(out["away"]) >= 8 and len(out["home"]) >= 8
         return out
-    except Exception as e:
-        return {"confirmed": False, "away": {}, "home": {}, "error": str(e)}
+    except Exception as exc:
+        return {"confirmed": False, "away": {}, "home": {}, "error": str(exc)}
 
 def get_games_raw(date_str):
     data = get_json(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher")
@@ -685,13 +694,36 @@ def hr_form(stat, profile, cache_hit):
     arrow = "↑" if rate >= .055 else ("→" if rate >= .030 else "↓")
     return f"{int(score)}% {arrow}"
 
-def hitter_row(player, team, opp_pitcher, profiles):
+def hitter_row(player, team, opp_team, opp_pitcher, profiles):
     pid = player.get("playerId")
     stat = hitter_season_stats(int(pid), current_season()) if pid else {}
     cache_hit = bool(pid and int(pid) in profiles)
     profile = profiles.get(int(pid)) if cache_hit else fallback_profile(stat)
     opp_hr9 = pitcher_hr9(opp_pitcher.get("id")) if opp_pitcher else None
     scores = calibrated_scores(stat, profile, opp_hr9, cache_hit)
+
+    starter_damage = 45
+    bullpen_damage = 45
+
+    if opp_pitcher and opp_pitcher.get("id"):
+        starter = starter_damage_from_pitcher(opp_pitcher.get("id"))
+        if starter:
+            starter_damage = safe_float(starter.get("starterDamage"), 45)
+
+    if opp_team and opp_team.get("id"):
+        bullpen = team_pitching_profile(int(opp_team.get("id")))
+        if bullpen:
+            bullpen_damage = safe_float(bullpen.get("bullpenDamage"), 45)
+
+    stack_boost = (
+        starter_damage * 0.18
+        + bullpen_damage * 0.12
+    )
+
+    scores["matchup"] = round(clamp(scores["matchup"] + stack_boost, 0, 99), 3)
+    scores["testScore"] = round(clamp(scores["testScore"] + stack_boost, 0, 99), 3)
+    scores["kHR"] = round(clamp(scores["kHR"] + (stack_boost * 0.70), 0, 99), 3)
+
 
     pa = safe_int(stat.get("plateAppearances"), 0)
     so = safe_int(stat.get("strikeOuts"), 0)
@@ -701,6 +733,7 @@ def hitter_row(player, team, opp_pitcher, profiles):
         "team": team.get("abbreviation", "MLB"),
         "teamLogo": team_logo(team.get("abbreviation", "MLB")),
         "lineupSpot": player.get("lineupSpot"),
+        "lineupStatus": player.get("lineupStatus", "projected"),
         "headshot": player_headshot(pid),
         "pitcher": (opp_pitcher or {}).get("fullName") or (opp_pitcher or {}).get("name") or "TBD",
         "AB": safe_int(stat.get("atBats"), 0),
@@ -731,6 +764,9 @@ def hitter_row(player, team, opp_pitcher, profiles):
         "zoneFit": scores["zoneFit"],
         "hrForm": hr_form(stat, profile, cache_hit),
         "kHR": scores["kHR"],
+        "starterDamage": round(starter_damage, 1),
+        "bullpenDamage": round(bullpen_damage, 1),
+        "stackBoost": round(stack_boost, 1),
         "likely": scores["likely"],
         "status": "Statcast ISO cache" if cache_hit else "Season fallback",
         "cacheHit": cache_hit,
@@ -747,31 +783,45 @@ def collect_hitter_rows(game_pk: int):
     away_pitcher = game.get("awayProbablePitcher") or {}
     home_pitcher = game.get("homeProbablePitcher") or {}
     profiles = load_cache()
-
     lineups = get_official_lineups(game_pk)
-
-    # Only show confirmed active lineup players.
-    # If official lineups are not posted, return no hitters instead of roster guesses.
-    if not lineups.get("confirmed"):
-        return []
 
     rows = []
 
-    away_players = sorted(lineups.get("away", {}).values(), key=lambda p: p.get("lineupSpot") or 99)
-    home_players = sorted(lineups.get("home", {}).values(), key=lambda p: p.get("lineupSpot") or 99)
+    if lineups.get("confirmed"):
+        away_players = sorted(
+            lineups.get("away", {}).values(),
+            key=lambda p: p.get("lineupSpot") or 99
+        )
+        home_players = sorted(
+            lineups.get("home", {}).values(),
+            key=lambda p: p.get("lineupSpot") or 99
+        )
 
-    for p in away_players:
-        rows.append(hitter_row(p, away, home_pitcher, profiles))
+        for p in away_players:
+            rows.append(hitter_row(p, away, home, home_pitcher, profiles))
 
-    for p in home_players:
-        rows.append(hitter_row(p, home, away_pitcher, profiles))
+        for p in home_players:
+            rows.append(hitter_row(p, home, away, away_pitcher, profiles))
 
-    rows.sort(key=lambda r: (
-        r.get("team", ""),
-        safe_int(r.get("lineupSpot"), 99),
-        -safe_float(r.get("kHR")),
-        r.get("name", "")
-    ))
+        rows.sort(key=lambda r: (
+            r.get("team", ""),
+            safe_int(r.get("lineupSpot"), 99),
+            -safe_float(r.get("kHR")),
+            r.get("name", "")
+        ))
+        return rows
+
+    # BEFORE official lineups:
+    # show the same active-roster projection data as before so the dashboard is not empty.
+    for p in active_roster(int(away.get("id") or 0)):
+        p = {**p, "lineupSpot": None, "lineupStatus": "projected"}
+        rows.append(hitter_row(p, away, home, home_pitcher, profiles))
+
+    for p in active_roster(int(home.get("id") or 0)):
+        p = {**p, "lineupSpot": None, "lineupStatus": "projected"}
+        rows.append(hitter_row(p, home, away, away_pitcher, profiles))
+
+    rows.sort(key=lambda r: (-safe_float(r.get("kHR")), r.get("team", ""), r.get("name", "")))
     return rows
 
 def pitcher_skill_profile(pitcher_id):
@@ -1083,7 +1133,7 @@ def stack_spots():
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v24 confirmed-lineup hitter filtering", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v26 projected dashboard + confirmed lineup switch", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
@@ -1100,6 +1150,7 @@ def game_detail(game_pk: int):
     return {
         "gamePk": game_pk,
         "lineupConfirmed": bool(lineup.get("confirmed")),
+        "lineupMode": "confirmed" if lineup.get("confirmed") else "projected",
         "lineupCounts": {
             "away": len(lineup.get("away", {})),
             "home": len(lineup.get("home", {})),
@@ -1107,7 +1158,7 @@ def game_detail(game_pk: int):
         "count": len(hitters),
         "cacheHits": sum(1 for h in hitters if h.get("cacheHit")),
         "cache": cache_meta(),
-        "source": "v24 confirmed active lineup hitters + Statcast event ISO",
+        "source": "v26 projected active-roster hitters until confirmed lineups, then official starters",
         "hitters": hitters,
     }
 
