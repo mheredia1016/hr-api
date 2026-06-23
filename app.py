@@ -694,6 +694,70 @@ def hr_form(stat, profile, cache_hit):
     arrow = "↑" if rate >= .055 else ("→" if rate >= .030 else "↓")
     return f"{int(score)}% {arrow}"
 
+def sb_tier(score):
+    if score >= 75:
+        return "🔥 Best"
+    if score >= 62:
+        return "🏃 Strong"
+    if score >= 50:
+        return "🎯 Live"
+    return "👀 Lean"
+
+def calculate_ksb(stat, profile, lineup_spot, starter_damage=45, bullpen_damage=45):
+    pa = safe_float(stat.get("plateAppearances"), 0)
+    sb = safe_float(stat.get("stolenBases"), 0)
+    cs = safe_float(stat.get("caughtStealing"), 0)
+    bb = safe_float(stat.get("baseOnBalls"), 0)
+    h = safe_float(stat.get("hits"), 0)
+    hbp = safe_float(stat.get("hitByPitch"), 0)
+    so = safe_float(stat.get("strikeOuts"), 0)
+
+    opportunities = max(1, h + bb + hbp)
+    attempts = sb + cs
+    attempt_rate = attempts / opportunities
+    success_rate = sb / attempts if attempts else 0
+
+    xwoba = safe_float(profile.get("xwOBA"), 0.315)
+    swstr = safe_float(profile.get("swStr"), 10)
+
+    try:
+        lineup_spot = int(lineup_spot) if lineup_spot else None
+    except Exception:
+        lineup_spot = None
+
+    lineup_bonus = 0
+    if lineup_spot in [1, 2]:
+        lineup_bonus = 16
+    elif lineup_spot in [3, 4, 5]:
+        lineup_bonus = 9
+    elif lineup_spot == 6:
+        lineup_bonus = 4
+    elif lineup_spot in [7, 8, 9]:
+        lineup_bonus = -3
+
+    score = 22
+    score += scale(sb, 2, 35) * 28
+    score += scale(attempt_rate, 0.02, 0.22) * 22
+    score += scale(success_rate, 0.55, 0.90) * 12
+    score += scale(xwoba, 0.295, 0.390) * 10
+    score += lineup_bonus
+    score += scale(starter_damage, 35, 80) * 4
+    score += scale(bullpen_damage, 35, 80) * 3
+    score -= scale(swstr, 9, 20) * 8
+    score -= scale(so / pa if pa else 0, 0.16, 0.32) * 5
+
+    final = round(clamp(score, 1, 99), 1)
+
+    return {
+        "kSB": final,
+        "sbTier": sb_tier(final),
+        "SB": int(sb),
+        "CS": int(cs),
+        "sbAttempts": int(attempts),
+        "sbAttemptRate": round(attempt_rate * 100, 1),
+        "sbSuccessRate": round(success_rate * 100, 1) if attempts else 0,
+    }
+
 def hitter_row(player, team, opp_team, opp_pitcher, profiles):
     pid = player.get("playerId")
     stat = hitter_season_stats(int(pid), current_season()) if pid else {}
@@ -718,6 +782,14 @@ def hitter_row(player, team, opp_team, opp_pitcher, profiles):
     stack_boost = (
         starter_damage * 0.18
         + bullpen_damage * 0.12
+    )
+
+    sb_scores = calculate_ksb(
+        stat,
+        profile,
+        player.get("lineupSpot"),
+        starter_damage,
+        bullpen_damage
     )
 
     scores["matchup"] = round(clamp(scores["matchup"] + stack_boost, 0, 99), 3)
@@ -764,6 +836,7 @@ def hitter_row(player, team, opp_team, opp_pitcher, profiles):
         "zoneFit": scores["zoneFit"],
         "hrForm": hr_form(stat, profile, cache_hit),
         "kHR": scores["kHR"],
+        **sb_scores,
         "starterDamage": round(starter_damage, 1),
         "bullpenDamage": round(bullpen_damage, 1),
         "stackBoost": round(stack_boost, 1),
