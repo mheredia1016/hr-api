@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from functools import lru_cache
 from pathlib import Path
-import csv, json, math, os, threading, time
+import csv, json, math, os, re, threading, time
 from io import StringIO
 
 app = FastAPI(title="HR Matchup API")
@@ -29,6 +29,193 @@ CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "36"))
 cache_build_lock = threading.Lock()
 cache_build_started_at = None
 last_cache_error = None
+
+
+# SportsGameOdds HR prop cache. The API key stays server-side on Railway.
+SGO_BASE_URL = os.getenv("SPORTSGAMEODDS_BASE_URL", "https://api.sportsgameodds.com/v2").rstrip("/")
+SGO_API_KEY = os.getenv("SPORTSGAMEODDS_API_KEY", "").strip()
+SGO_LEAGUE_ID = os.getenv("SPORTSGAMEODDS_MLB_LEAGUE_ID", "MLB").strip() or "MLB"
+SGO_BOOKMAKERS = [x.strip().lower() for x in os.getenv(
+    "SPORTSGAMEODDS_HR_BOOKMAKERS", "fanduel,draftkings,hardrockbet"
+).split(",") if x.strip()]
+SGO_CACHE_SECONDS = int(os.getenv("SPORTSGAMEODDS_CACHE_SECONDS", "90"))
+_sgo_cache = {"at": 0.0, "events": []}
+_sgo_lock = threading.Lock()
+
+BOOK_DISPLAY = {
+    "fanduel": "FanDuel",
+    "draftkings": "DraftKings",
+    "hardrockbet": "Hard Rock",
+}
+
+def _sgo_norm(value):
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+def _sgo_blob(obj):
+    parts = []
+    def walk(v):
+        if isinstance(v, dict):
+            for k, val in v.items():
+                parts.append(str(k))
+                walk(val)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif v is not None:
+            parts.append(str(v))
+    walk(obj)
+    return " ".join(parts).lower()
+
+def _sgo_name_match(name, text):
+    wanted = _sgo_norm(name)
+    hay = _sgo_norm(text)
+    if wanted and wanted in hay:
+        return True
+    tokens = [t for t in re.sub(r"[^a-z0-9 ]", " ", str(name or "").lower()).split() if len(t) > 1]
+    return len(tokens) >= 2 and all(t in str(text or "").lower() for t in tokens)
+
+def _sgo_events():
+    if not SGO_API_KEY:
+        return []
+    now = time.time()
+    if now - float(_sgo_cache.get("at", 0)) < SGO_CACHE_SECONDS:
+        return _sgo_cache.get("events", [])
+    with _sgo_lock:
+        now = time.time()
+        if now - float(_sgo_cache.get("at", 0)) < SGO_CACHE_SECONDS:
+            return _sgo_cache.get("events", [])
+        try:
+            params = {
+                "leagueID": SGO_LEAGUE_ID,
+                "oddsAvailable": "true",
+                "bookmakerID": ",".join(SGO_BOOKMAKERS),
+                "includeAltLines": "true",
+                "limit": 100,
+            }
+            headers = {"X-Api-Key": SGO_API_KEY, "Accept": "application/json"}
+            resp = SESSION.get(f"{SGO_BASE_URL}/events", params=params, headers=headers, timeout=20)
+            if resp.status_code in (401, 403):
+                # Some SGO accounts use apiKey as a query parameter.
+                params["apiKey"] = SGO_API_KEY
+                resp = SESSION.get(f"{SGO_BASE_URL}/events", params=params, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if isinstance(data, dict):
+                events = data.get("events") or data.get("items") or data.get("results") or []
+            else:
+                events = data or []
+            if isinstance(events, dict):
+                events = list(events.values())
+            _sgo_cache.update({"at": now, "events": events if isinstance(events, list) else []})
+        except Exception as exc:
+            print(f"SportsGameOdds fetch warning: {exc}")
+            _sgo_cache["at"] = now
+        return _sgo_cache.get("events", [])
+
+def _sgo_event_for_game(game):
+    away = normalize_team(game.get("away") or {})
+    home = normalize_team(game.get("home") or {})
+    away_names = [away.get("name"), away.get("teamName"), away.get("abbreviation")]
+    home_names = [home.get("name"), home.get("teamName"), home.get("abbreviation")]
+    for event in _sgo_events():
+        blob = _sgo_blob(event)
+        away_ok = any(v and _sgo_norm(v) in _sgo_norm(blob) for v in away_names)
+        home_ok = any(v and _sgo_norm(v) in _sgo_norm(blob) for v in home_names)
+        if away_ok and home_ok:
+            return event
+    return None
+
+def _sgo_odds_iter(event):
+    odds = event.get("odds", {}) if isinstance(event, dict) else {}
+    if isinstance(odds, dict):
+        return list(odds.values())
+    return odds if isinstance(odds, list) else []
+
+def _sgo_is_hr_yes(odd):
+    blob = _sgo_blob(odd)
+    stat_id = str(odd.get("statID", "")).lower() if isinstance(odd, dict) else ""
+    market = str(odd.get("marketName", "")).lower() if isinstance(odd, dict) else ""
+    side = str(odd.get("sideID", "")).lower() if isinstance(odd, dict) else ""
+    bet_type = str(odd.get("betTypeID", "")).lower() if isinstance(odd, dict) else ""
+    hr_market = (
+        "home run" in market or "home runs" in market or
+        stat_id in {"homeruns", "homerun", "hr"} or
+        "to hit a home run" in blob
+    )
+    positive_side = side in {"yes", "over", "1", "home"} or bet_type not in {"yn", "ou"}
+    if side in {"no", "under"}:
+        positive_side = False
+    return hr_market and positive_side
+
+def _sgo_entity_names(event):
+    out = {}
+    def walk(v):
+        if isinstance(v, dict):
+            entity_id = v.get("playerID") or v.get("playerId") or v.get("entityID") or v.get("id")
+            name = v.get("name") or v.get("fullName") or v.get("displayName")
+            if entity_id is not None and name:
+                out[str(entity_id)] = str(name)
+            for val in v.values():
+                walk(val)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+    walk(event.get("players", event.get("lineups", {})) if isinstance(event, dict) else {})
+    return out
+
+def sgo_hr_sportsbooks_for_rows(game, rows):
+    event = _sgo_event_for_game(game)
+    if not event:
+        return {}
+    entity_names = _sgo_entity_names(event)
+    result = {str(r.get("playerId")): {} for r in rows if r.get("playerId")}
+    result_by_name = {str(r.get("name")): {} for r in rows}
+
+    for odd in _sgo_odds_iter(event):
+        if not isinstance(odd, dict) or not _sgo_is_hr_yes(odd):
+            continue
+        odd_blob = _sgo_blob(odd)
+        entity_name = entity_names.get(str(odd.get("statEntityID", "")), "")
+        matched = None
+        for row in rows:
+            if _sgo_name_match(row.get("name"), f"{entity_name} {odd_blob}"):
+                matched = row
+                break
+        if not matched:
+            continue
+        by_book = odd.get("byBookmaker") or {}
+        if not isinstance(by_book, dict):
+            continue
+        books = {}
+        for book in SGO_BOOKMAKERS:
+            node = by_book.get(book)
+            if not isinstance(node, dict) or node.get("available") is False:
+                continue
+            odds_value = node.get("odds")
+            deeplink = node.get("deeplink") or node.get("deepLink") or node.get("url")
+            if odds_value in (None, "") and not deeplink:
+                continue
+            books[book] = {
+                "name": BOOK_DISPLAY.get(book, book.title()),
+                "odds": str(odds_value) if odds_value not in (None, "") else None,
+                "deeplink": deeplink,
+            }
+        if books:
+            result_by_name[str(matched.get("name"))] = books
+            if matched.get("playerId"):
+                result[str(matched.get("playerId"))] = books
+    return {"byId": result, "byName": result_by_name}
+
+def attach_sgo_hr_sportsbooks(game, rows):
+    if not rows or not SGO_API_KEY:
+        return rows
+    lookup = sgo_hr_sportsbooks_for_rows(game, rows)
+    by_id = lookup.get("byId", {})
+    by_name = lookup.get("byName", {})
+    for row in rows:
+        row["sportsbooks"] = by_id.get(str(row.get("playerId"))) or by_name.get(str(row.get("name"))) or {}
+    return rows
 
 TEAM_ABBR_BY_ID = {
     108: "LAA", 109: "AZ", 110: "BAL", 111: "BOS", 112: "CHC",
@@ -510,6 +697,193 @@ def build_cache():
 
     cache_build_started_at = datetime.now(TZ).isoformat()
     last_cache_error = None
+
+
+# SportsGameOdds HR prop cache. The API key stays server-side on Railway.
+SGO_BASE_URL = os.getenv("SPORTSGAMEODDS_BASE_URL", "https://api.sportsgameodds.com/v2").rstrip("/")
+SGO_API_KEY = os.getenv("SPORTSGAMEODDS_API_KEY", "").strip()
+SGO_LEAGUE_ID = os.getenv("SPORTSGAMEODDS_MLB_LEAGUE_ID", "MLB").strip() or "MLB"
+SGO_BOOKMAKERS = [x.strip().lower() for x in os.getenv(
+    "SPORTSGAMEODDS_HR_BOOKMAKERS", "fanduel,draftkings,hardrockbet"
+).split(",") if x.strip()]
+SGO_CACHE_SECONDS = int(os.getenv("SPORTSGAMEODDS_CACHE_SECONDS", "90"))
+_sgo_cache = {"at": 0.0, "events": []}
+_sgo_lock = threading.Lock()
+
+BOOK_DISPLAY = {
+    "fanduel": "FanDuel",
+    "draftkings": "DraftKings",
+    "hardrockbet": "Hard Rock",
+}
+
+def _sgo_norm(value):
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+def _sgo_blob(obj):
+    parts = []
+    def walk(v):
+        if isinstance(v, dict):
+            for k, val in v.items():
+                parts.append(str(k))
+                walk(val)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif v is not None:
+            parts.append(str(v))
+    walk(obj)
+    return " ".join(parts).lower()
+
+def _sgo_name_match(name, text):
+    wanted = _sgo_norm(name)
+    hay = _sgo_norm(text)
+    if wanted and wanted in hay:
+        return True
+    tokens = [t for t in re.sub(r"[^a-z0-9 ]", " ", str(name or "").lower()).split() if len(t) > 1]
+    return len(tokens) >= 2 and all(t in str(text or "").lower() for t in tokens)
+
+def _sgo_events():
+    if not SGO_API_KEY:
+        return []
+    now = time.time()
+    if now - float(_sgo_cache.get("at", 0)) < SGO_CACHE_SECONDS:
+        return _sgo_cache.get("events", [])
+    with _sgo_lock:
+        now = time.time()
+        if now - float(_sgo_cache.get("at", 0)) < SGO_CACHE_SECONDS:
+            return _sgo_cache.get("events", [])
+        try:
+            params = {
+                "leagueID": SGO_LEAGUE_ID,
+                "oddsAvailable": "true",
+                "bookmakerID": ",".join(SGO_BOOKMAKERS),
+                "includeAltLines": "true",
+                "limit": 100,
+            }
+            headers = {"X-Api-Key": SGO_API_KEY, "Accept": "application/json"}
+            resp = SESSION.get(f"{SGO_BASE_URL}/events", params=params, headers=headers, timeout=20)
+            if resp.status_code in (401, 403):
+                # Some SGO accounts use apiKey as a query parameter.
+                params["apiKey"] = SGO_API_KEY
+                resp = SESSION.get(f"{SGO_BASE_URL}/events", params=params, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if isinstance(data, dict):
+                events = data.get("events") or data.get("items") or data.get("results") or []
+            else:
+                events = data or []
+            if isinstance(events, dict):
+                events = list(events.values())
+            _sgo_cache.update({"at": now, "events": events if isinstance(events, list) else []})
+        except Exception as exc:
+            print(f"SportsGameOdds fetch warning: {exc}")
+            _sgo_cache["at"] = now
+        return _sgo_cache.get("events", [])
+
+def _sgo_event_for_game(game):
+    away = normalize_team(game.get("away") or {})
+    home = normalize_team(game.get("home") or {})
+    away_names = [away.get("name"), away.get("teamName"), away.get("abbreviation")]
+    home_names = [home.get("name"), home.get("teamName"), home.get("abbreviation")]
+    for event in _sgo_events():
+        blob = _sgo_blob(event)
+        away_ok = any(v and _sgo_norm(v) in _sgo_norm(blob) for v in away_names)
+        home_ok = any(v and _sgo_norm(v) in _sgo_norm(blob) for v in home_names)
+        if away_ok and home_ok:
+            return event
+    return None
+
+def _sgo_odds_iter(event):
+    odds = event.get("odds", {}) if isinstance(event, dict) else {}
+    if isinstance(odds, dict):
+        return list(odds.values())
+    return odds if isinstance(odds, list) else []
+
+def _sgo_is_hr_yes(odd):
+    blob = _sgo_blob(odd)
+    stat_id = str(odd.get("statID", "")).lower() if isinstance(odd, dict) else ""
+    market = str(odd.get("marketName", "")).lower() if isinstance(odd, dict) else ""
+    side = str(odd.get("sideID", "")).lower() if isinstance(odd, dict) else ""
+    bet_type = str(odd.get("betTypeID", "")).lower() if isinstance(odd, dict) else ""
+    hr_market = (
+        "home run" in market or "home runs" in market or
+        stat_id in {"homeruns", "homerun", "hr"} or
+        "to hit a home run" in blob
+    )
+    positive_side = side in {"yes", "over", "1", "home"} or bet_type not in {"yn", "ou"}
+    if side in {"no", "under"}:
+        positive_side = False
+    return hr_market and positive_side
+
+def _sgo_entity_names(event):
+    out = {}
+    def walk(v):
+        if isinstance(v, dict):
+            entity_id = v.get("playerID") or v.get("playerId") or v.get("entityID") or v.get("id")
+            name = v.get("name") or v.get("fullName") or v.get("displayName")
+            if entity_id is not None and name:
+                out[str(entity_id)] = str(name)
+            for val in v.values():
+                walk(val)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+    walk(event.get("players", event.get("lineups", {})) if isinstance(event, dict) else {})
+    return out
+
+def sgo_hr_sportsbooks_for_rows(game, rows):
+    event = _sgo_event_for_game(game)
+    if not event:
+        return {}
+    entity_names = _sgo_entity_names(event)
+    result = {str(r.get("playerId")): {} for r in rows if r.get("playerId")}
+    result_by_name = {str(r.get("name")): {} for r in rows}
+
+    for odd in _sgo_odds_iter(event):
+        if not isinstance(odd, dict) or not _sgo_is_hr_yes(odd):
+            continue
+        odd_blob = _sgo_blob(odd)
+        entity_name = entity_names.get(str(odd.get("statEntityID", "")), "")
+        matched = None
+        for row in rows:
+            if _sgo_name_match(row.get("name"), f"{entity_name} {odd_blob}"):
+                matched = row
+                break
+        if not matched:
+            continue
+        by_book = odd.get("byBookmaker") or {}
+        if not isinstance(by_book, dict):
+            continue
+        books = {}
+        for book in SGO_BOOKMAKERS:
+            node = by_book.get(book)
+            if not isinstance(node, dict) or node.get("available") is False:
+                continue
+            odds_value = node.get("odds")
+            deeplink = node.get("deeplink") or node.get("deepLink") or node.get("url")
+            if odds_value in (None, "") and not deeplink:
+                continue
+            books[book] = {
+                "name": BOOK_DISPLAY.get(book, book.title()),
+                "odds": str(odds_value) if odds_value not in (None, "") else None,
+                "deeplink": deeplink,
+            }
+        if books:
+            result_by_name[str(matched.get("name"))] = books
+            if matched.get("playerId"):
+                result[str(matched.get("playerId"))] = books
+    return {"byId": result, "byName": result_by_name}
+
+def attach_sgo_hr_sportsbooks(game, rows):
+    if not rows or not SGO_API_KEY:
+        return rows
+    lookup = sgo_hr_sportsbooks_for_rows(game, rows)
+    by_id = lookup.get("byId", {})
+    by_name = lookup.get("byName", {})
+    for row in rows:
+        row["sportsbooks"] = by_id.get(str(row.get("playerId"))) or by_name.get(str(row.get("name"))) or {}
+    return rows
     try:
         end = (now_ct() - timedelta(days=1)).date()
         start = end - timedelta(days=LOOKBACK_DAYS)
@@ -882,7 +1256,7 @@ def collect_hitter_rows(game_pk: int):
             -safe_float(r.get("kHR")),
             r.get("name", "")
         ))
-        return rows
+        return attach_sgo_hr_sportsbooks(game, rows)
 
     # BEFORE official lineups:
     # show the same active-roster projection data as before so the dashboard is not empty.
@@ -895,7 +1269,7 @@ def collect_hitter_rows(game_pk: int):
         rows.append(hitter_row(p, home, away, away_pitcher, profiles))
 
     rows.sort(key=lambda r: (-safe_float(r.get("kHR")), r.get("team", ""), r.get("name", "")))
-    return rows
+    return attach_sgo_hr_sportsbooks(game, rows)
 
 def pitcher_skill_profile(pitcher_id):
     if not pitcher_id:
@@ -1110,6 +1484,8 @@ def top_targets_for_team(game_pk, team_abbr, limit=3):
                 "HH": r.get("HH"),
                 "swStr": r.get("swStr"),
                 "pitcher": r.get("pitcher"),
+                "lineupStatus": r.get("lineupStatus"),
+                "sportsbooks": r.get("sportsbooks", {}),
             }
             for r in team_rows[:limit]
         ]
@@ -1206,7 +1582,7 @@ def stack_spots():
 @app.get("/")
 def root():
     ensure_cache_background()
-    return {"status": "ok", "message": "HR API v26 projected dashboard + confirmed lineup switch", "cache": cache_meta()}
+    return {"status": "ok", "message": "HR API v27 lineup filtering + SportsGameOdds HR deeplinks", "cache": cache_meta()}
 
 @app.get("/games")
 @app.get("/api/games")
